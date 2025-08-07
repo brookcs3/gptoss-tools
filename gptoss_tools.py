@@ -15,10 +15,30 @@ from openai_harmony import (
     Message,
     Role,
     TextContent,
-    ToolNamespaceConfig,
 )
 
-from gpt_oss.tools.tool import Tool
+# We'll use standard OpenAI function calling format instead of gpt_oss.tools
+from abc import ABC, abstractmethod
+
+
+class Tool(ABC):
+    """Simple tool base class for our GPT-OSS integration"""
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        pass
+    
+    @abstractmethod 
+    def instruction(self) -> str:
+        pass
+        
+    @abstractmethod
+    async def _process(self, message) -> AsyncIterator:
+        pass
+        
+    def error_message(self, error_message: str, channel: str = None):
+        return f"❌ {self.name} Error: {error_message}"
 
 
 class GPTOSSFileTool(Tool):
@@ -214,16 +234,40 @@ Examples:
             return f"❌ **Write Error:** {str(e)}"
 
 
-# Tool configurations for system prompt
-FILE_TOOL_CONFIG = ToolNamespaceConfig(
-    namespace="file_operations",
-    description="Find, read, and search files in the project",
-)
+# For now, let's use simple dictionaries instead of ToolNamespaceConfig
+# We'll use standard OpenAI function calling format
+FILE_TOOL_CONFIG = {
+    "type": "function",
+    "function": {
+        "name": "file_operations",
+        "description": "Find, read, and search files in the project",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "description": "Operation: find, read, grep, search, analyze"},
+                "args": {"type": "string", "description": "Arguments for the operation"}
+            },
+            "required": ["operation"]
+        }
+    }
+}
 
-WRITE_TOOL_CONFIG = ToolNamespaceConfig(
-    namespace="file_writer", 
-    description="Create and edit files with templates",
-)
+WRITE_TOOL_CONFIG = {
+    "type": "function", 
+    "function": {
+        "name": "file_writer",
+        "description": "Create and edit files with templates",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "description": "Operation: create, edit, backup, templates"},
+                "filename": {"type": "string", "description": "File to create or edit"},
+                "args": {"type": "string", "description": "Additional arguments"}
+            },
+            "required": ["operation"]
+        }
+    }
+}
 
 # Export tools for easy import
 GPTOSS_TOOLS = {
@@ -231,6 +275,6 @@ GPTOSS_TOOLS = {
     "file_writer": GPTOSSWriteTool(),
 }
 
-def get_tool_configs() -> list[ToolNamespaceConfig]:
+def get_tool_configs() -> list:
     """Get all tool configurations for system prompt"""
     return [FILE_TOOL_CONFIG, WRITE_TOOL_CONFIG]

@@ -7,26 +7,9 @@ Full AI chat integration with tool calling capabilities
 import subprocess
 import os
 import json
-import requests
-import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-
-# Harmony format imports
-from openai_harmony import (
-    SystemContent, 
-    Message as HarmonyMessage, 
-    Conversation, 
-    Role as HarmonyRole, 
-    TextContent,
-    Author,
-    load_harmony_encoding, 
-    HarmonyEncodingName
-)
-
-# Import our GPT-OSS tools
-from gptoss_tools import GPTOSS_TOOLS, get_tool_configs
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Grid, Horizontal, Vertical, ScrollableContainer
@@ -38,11 +21,12 @@ from textual.widgets import (
 from textual.screen import Screen
 from textual.reactive import reactive
 from textual.binding import Binding
-from textual.message import Message as TextualMessage
+from textual.message import Message
 from textual.worker import Worker
 
 # Import our custom panels
 from thinking_panel import ThinkingPanel
+from chat_panel import ChatPanel
 
 
 class ChatMessage(Container):
@@ -67,25 +51,14 @@ class ChatMessage(Container):
 
 
 class ChatPanel(Container):
-    """Main chat interface panel with Harmony integration"""
+    """Main chat interface panel"""
     
     messages = reactive([])
     
     def __init__(self):
         super().__init__()
-        self.ollama_url = "http://localhost:11434/api/chat"
+        self.ollama_url = "http://localhost:11434/api/generate"
         self.model = "gpt-oss:20b"
-        self.conversation_history = []
-        
-        # Initialize Harmony encoding
-        try:
-            self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-        except Exception as e:
-            print(f"Warning: Could not load Harmony encoding: {e}")
-            self.encoding = None
-        
-        # Initialize tools
-        self.tools = GPTOSS_TOOLS
     
     def compose(self) -> ComposeResult:
         yield Label("🤖 GPT OSS Chat", classes="panel-header")
@@ -153,24 +126,43 @@ class ChatPanel(Container):
         chat_history.scroll_end()
     
     def get_ai_response(self, user_message: str):
-        """Get response from GPT OSS model using Harmony format"""
+        """Get response from GPT OSS model"""
         try:
             # Show typing indicator
             self.add_message("assistant", "🤔 Thinking...")
             
-            # Create Harmony conversation
-            if self.encoding:
-                response = self._call_ollama_harmony(user_message)
-            else:
-                # Fallback to simple API if Harmony fails
-                response = self._call_ollama_simple(user_message)
+            # Prepare the prompt with system context
+            system_prompt = """You are GPT OSS, an AI assistant integrated into a powerful development toolkit. You can help with:
+
+1. **File Operations**: Finding, reading, and analyzing files
+2. **Code Search**: Searching through codebases and finding patterns  
+3. **Project Analysis**: Understanding project structure and dependencies
+4. **Tool Execution**: Running development tools and commands
+
+Available tools in this environment:
+- `glop <pattern>` - Find files by pattern (e.g., "*.py", "*.js")
+- `grep <query>` - Search file contents for text patterns
+- `search <query>` - Semantic search through indexed files
+- `read <file>` - Display file contents with syntax highlighting
+- `readymyfiles` - Prepare files for AI analysis
+- `filewrite` - Create and edit files
+
+When users ask you to perform actions, suggest specific tool commands or execute them if requested. Be helpful, practical, and focus on developer productivity.
+
+User message: """
             
-            # Remove typing indicator 
+            # Call Ollama API
+            response = self._call_ollama(system_prompt + user_message)
+            
+            # Remove typing indicator and add real response
             chat_history = self.query_one("#chat_history", ScrollableContainer)
             if chat_history.children:
                 chat_history.children[-1].remove()
             
             self.add_message("assistant", response)
+            
+            # Check if response contains tool suggestions
+            self._handle_tool_suggestions(response)
             
         except Exception as e:
             # Remove typing indicator
@@ -181,203 +173,92 @@ class ChatPanel(Container):
             error_msg = f"❌ Error: {str(e)}\n\nMake sure Ollama is running: `ollama serve`"
             self.add_message("assistant", error_msg)
     
-    def _call_ollama_harmony(self, user_message: str) -> str:
-        """Call Ollama using Harmony format with tool support"""
-        try:
-            # Create system message with tools
-            system_content = SystemContent.new().with_conversation_start_date(
-                datetime.now().strftime("%Y-%m-%d")
-            ).with_tools([tool_config for tool_config in get_tool_configs()])
-            
-            system_message = HarmonyMessage.from_role_and_content(
-                HarmonyRole.SYSTEM, system_content
-            )
-            
-            # Add conversation history 
-            messages = [system_message] + self.conversation_history
-            
-            # Add current user message
-            user_msg = HarmonyMessage.from_role_and_content(
-                HarmonyRole.USER, TextContent(text=user_message)
-            )
-            messages.append(user_msg)
-            self.conversation_history.append(user_msg)
-            
-            # Create conversation
-            conversation = Conversation.from_messages(messages)
-            
-            # Convert to tokens for Ollama
-            token_ids = self.encoding.render_conversation_for_completion(
-                conversation, HarmonyRole.ASSISTANT
-            )
-            
-            # Call Ollama with chat API
-            ollama_messages = []
-            for msg in messages:
-                if msg.author.role == HarmonyRole.SYSTEM:
-                    ollama_messages.append({"role": "system", "content": str(msg.content)})
-                elif msg.author.role == HarmonyRole.USER:
-                    ollama_messages.append({"role": "user", "content": msg.content.text})
-                elif msg.author.role == HarmonyRole.ASSISTANT:
-                    ollama_messages.append({"role": "assistant", "content": str(msg.content)})
-            
-            response = requests.post(
-                self.ollama_url,
-                json={
-                    "model": self.model,
-                    "messages": ollama_messages,
-                    "stream": False,
-                    "options": {"temperature": 1.0}
-                },
-                timeout=120
-            )
-            response.raise_for_status()
-            
-            result = response.json()
-            assistant_response = result.get("message", {}).get("content", "No response")
-            
-            # Parse response for tool calls
-            self._handle_harmony_response(assistant_response)
-            
-            return assistant_response
-            
-        except Exception as e:
-            print(f"Harmony API failed: {e}")
-            return self._call_ollama_simple(user_message)
-    
-    def _call_ollama_simple(self, user_message: str) -> str:
-        """Fallback simple Ollama API call"""
-        system_prompt = """You are GPT OSS, an AI development assistant with access to file tools.
+    def _call_ollama(self, prompt: str) -> str:
+        """Call Ollama API synchronously"""
+        import requests
         
-Available operations:
-- To find files: Use "file_operations find <pattern>" 
-- To read files: Use "file_operations read <filename>"
-- To search text: Use "file_operations grep <query>"
-- To semantic search: Use "file_operations search <query>"
-- To analyze project: Use "file_operations analyze codebase"
-- To create files: Use "file_writer create <filename>"
-
-When users ask for file operations, use the exact format above."""
+        data = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.7,
+                "max_tokens": 4096
+            }
+        }
         
-        response = requests.post(
-            "http://localhost:11434/api/chat",
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                "stream": False
-            },
-            timeout=90
-        )
+        # Define stream variable to match the parameter in the request
+        response = requests.post(self.ollama_url, json=data, timeout=90)
         response.raise_for_status()
         
         result = response.json()
-        assistant_response = result.get("message", {}).get("content", "No response")
         
-        # Handle simple tool suggestions
-        self._handle_simple_tool_suggestions(assistant_response)
+        # Extract thinking and send to ThinkingPanel
+        thinking = result.get("thinking", "")
+        if thinking.strip():
+            thinking_panel = self.app.query_one("#thinking_panel", ThinkingPanel)
+            thinking_panel.add_thinking(thinking)
         
-        return assistant_response
+        return result.get("response", "No response generated")
     
-    def _handle_harmony_response(self, response: str):
-        """Handle Harmony-formatted response with potential tool calls"""
-        # This would parse proper Harmony tool calls
-        # For now, fall back to simple parsing
-        self._handle_simple_tool_suggestions(response)
-    
-    def _handle_simple_tool_suggestions(self, response: str):
-        """Handle simple tool suggestions in AI response"""
+    def _handle_tool_suggestions(self, response: str):
+        """Execute tool commands suggested by AI"""
+        # Look for tool commands in response (simple pattern matching)
         lines = response.split('\n')
         for line in lines:
             line = line.strip()
-            
-            # Look for tool operation patterns
-            if "file_operations" in line or "file_writer" in line:
-                # Extract tool command
-                if line.startswith('"') and line.endswith('"'):
-                    command = line[1:-1]  # Remove quotes
-                elif '"' in line:
-                    # Extract quoted command
-                    start = line.find('"') + 1
-                    end = line.rfind('"')
-                    if start < end:
-                        command = line[start:end]
-                    else:
-                        continue
-                else:
-                    command = line
-                
-                # Execute the tool command
-                if command.startswith(("file_operations", "file_writer")):
-                    self._execute_harmony_tool(command)
+            if line.startswith('`') and line.endswith('`'):
+                # Extract command from code block
+                command = line[1:-1]
+                if any(tool in command for tool in ['glop', 'grep', 'search', 'read']):
+                    # Auto-execute the suggested command
+                    self._execute_tool_command(command)
     
-    def _execute_harmony_tool(self, command: str):
-        """Execute a harmony tool command"""
+    def _execute_tool_command(self, command: str):
+        """Execute a tool command and show results"""
         try:
-            parts = command.split(" ", 1)
-            if len(parts) < 2:
-                return
-                
-            tool_name = parts[0]
-            tool_args = parts[1]
+            tools_dir = Path(__file__).parent
+            result = subprocess.run(
+                command, 
+                shell=True, 
+                cwd=tools_dir,
+                capture_output=True, 
+                text=True,
+                timeout=10
+            )
             
-            if tool_name in self.tools:
-                tool = self.tools[tool_name]
+            if result.stdout:
+                output = f"📋 Command: `{command}`\n\n```\n{result.stdout}\n```"
+                self.add_message("assistant", output)
+            
+            if result.stderr:
+                error = f"⚠️ Command error: `{command}`\n\n```\n{result.stderr}\n```"
+                self.add_message("assistant", error)
                 
-                # Create a mock Harmony message for the tool
-                tool_message = HarmonyMessage(
-                    author=Author(role=HarmonyRole.USER, name="user"),
-                    content=TextContent(text=tool_args)
-                )
-                
-                # Execute tool (simplified sync version)
-                try:
-                    # This is a simplified sync execution
-                    # In a real implementation, this should be async
-                    result = asyncio.run(self._run_tool_async(tool, tool_message))
-                    if result:
-                        self.add_message("assistant", result)
-                except Exception as tool_error:
-                    self.add_message("assistant", f"❌ Tool error: {str(tool_error)}")
-                    
         except Exception as e:
-            self.add_message("assistant", f"❌ Tool execution failed: {str(e)}")
-    
-    async def _run_tool_async(self, tool, message):
-        """Run tool asynchronously and return result"""
-        results = []
-        async for response_msg in tool.process(message):
-            if response_msg.content:
-                results.append(str(response_msg.content))
-        return "\n".join(results) if results else "Tool executed successfully"
+            error = f"❌ Failed to execute: `{command}`\n\nError: {str(e)}"
+            self.add_message("assistant", error)
     
     def show_tools_help(self):
-        """Show available tools with Harmony format"""
-        tools_help = """## 🛠️ Available Tools
+        """Show available tools"""
+        tools_help = """## Available Tools
 
-**File Operations Tool (`file_operations`):**
-- `find *.py` - Find Python files
-- `read config.yaml` - View file contents with syntax highlighting
-- `grep function --recursive` - Search for text in files
-- `search authentication` - Semantic search through codebase
-- `analyze codebase` - Get project structure overview
+**File Operations:**
+- `glop "*.py"` - Find Python files
+- `read config.yaml` - View file contents
+- `grep "function"` - Search for text in files
 
-**File Writer Tool (`file_writer`):**
-- `create main.py --template=python` - Create new files with templates
-- `edit README.md --operation=append` - Edit existing files
-- `backup --all` - Create file backups
-- `templates` - List available file templates
+**Search & Analysis:**
+- `search "authentication"` - Semantic search
+- `readymyfiles analyze-codebase` - Project analysis
 
-**Natural Language Examples:**
-- "Find all Python files in this project" 
-- "Show me the configuration file"
+**Examples:**
+- "Find all Python files in this project"
 - "Search for authentication code"
-- "Create a new JavaScript file"
-- "Analyze the project structure"
+- "Show me the config file"
+- "Analyze this codebase structure"
 
-💡 Just ask naturally - I'll automatically use the right tools!"""
+Just ask naturally - I'll suggest the right tools!"""
         
         self.add_message("assistant", tools_help)
 
