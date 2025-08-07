@@ -20,7 +20,7 @@ class ReadTool:
         self.config = self.load_config(config_path)
         self.syntax_highlighting = self.config.get('tools', {}).get('read', {}).get('syntax_highlighting', True)
         self.line_numbers = self.config.get('tools', {}).get('read', {}).get('line_numbers', True)
-        self.max_lines = self.config.get('tools', {}).get('read', {}).get('max_lines', 500)
+        self.max_lines = self.config.get('tools', {}).get('read', {}).get('max_lines', 20000)
         
     def load_config(self, config_path: str = None) -> dict:
         """Load configuration from YAML file"""
@@ -213,7 +213,7 @@ class ReadTool:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                     for i, line in enumerate(f):
-                        if i >= 5:  # First 5 lines
+                        if i >= 50:  # First 5 lines
                             break
                         preview_lines.append(line.rstrip())
             except:

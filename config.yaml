@@ -30,7 +30,7 @@ gptoss:
       
     search:
       index_directory: ".gptoss-index"
-      max_file_size: "5MB"
+      max_file_size: "10MB"
       supported_types:
         - ".py"
         - ".js"
@@ -44,7 +44,7 @@ gptoss:
     read:
       syntax_highlighting: true
       line_numbers: true
-      max_lines: 500
+      max_lines: 20000
       
     filewrite:
       backup_enabled: true
@@ -52,7 +52,7 @@ gptoss:
       
     readymyfiles:
       output_directory: "prepared-files"
-      max_files_per_bundle: 50
+      max_files_per_bundle: 100
       include_metadata: true
 
 # File type associations
