@@ -183,3 +183,16 @@ The project includes comprehensive session documentation in `EDIT*.md` files det
 2. **Context limit expansion** to full 20B model capacity  
 3. **Enhanced clipboard functionality** across all environments
 4. **File editing integration** within TUI interface
+
+## Memories
+
+- Have the entire @gpt-oss/README.md in memory for use during development and context understanding
+- Have entire @gpt-oss/docs/run-locally-ollama.md in memory for use
+- Have entire @harmony/README.md in memory for use
+- Have entire @harmony/docs/python.md  in memory for use
+- Have entire @gpt_oss_tui.py in memory for use
+- Have entire @chat_panel.py in memory for use
+- Have entire @thinking_panel.py in memory for use
+- Have entire @textual/ in memory for use
+- Have entire @gpt-oss/ in memory for use
+- Have entire @gpt-oss/gpt-oss-mcp-server/ in memory for use

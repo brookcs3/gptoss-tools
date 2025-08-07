@@ -126,17 +126,37 @@ class ChatPanel(Container):
         chat_history.scroll_end()
     
     def get_ai_response(self, user_message: str):
-        """Get response from GPT OSS model with proper tool calling"""
+        """Get response from GPT OSS model"""
         try:
             # Show typing indicator
             self.add_message("assistant", "🤔 Thinking...")
             
-            # Try tool calling first, fall back to simple if it fails
-            try:
-                response = self._call_ollama_with_tools(user_message)
-            except Exception as e:
-                print(f"Tool calling failed, falling back to simple: {e}")
-                response = self._call_ollama_simple(user_message)
+            # Use original working format with thinking panel
+            system_prompt = """You are GPT OSS, an AI assistant integrated into a powerful development toolkit. You can help with:
+
+1. **File Operations**: Finding, reading, and analyzing files
+2. **Code Search**: Searching through codebases and finding patterns  
+3. **Project Analysis**: Understanding project structure and dependencies
+4. **Tool Execution**: Running development tools and commands
+
+Available tools in this environment:
+- `glop <pattern>` - Find files by pattern (e.g., "*.py", "*.js")
+- `grep <query>` - Search file contents for text patterns
+- `search <query>` - Semantic search through indexed files
+- `read <file>` - Display file contents with syntax highlighting
+- `readymyfiles` - Prepare files for AI analysis
+- `filewrite` - Create and edit files
+
+When users ask you to perform actions, suggest specific tool commands or execute them if requested. Be helpful, practical, and focus on developer productivity.
+
+User message: """
+            
+            # Check if this looks like a file read request
+            if self._should_use_file_read_tool(user_message):
+                response = self._call_ollama_with_file_read_working(user_message)
+            else:
+                # Use original format for other requests
+                response = self._call_ollama(system_prompt + user_message)
             
             # Remove typing indicator and add real response
             chat_history = self.query_one("#chat_history", ScrollableContainer)
@@ -157,6 +177,77 @@ class ChatPanel(Container):
             error_msg = f"❌ Error: {str(e)}\n\nMake sure Ollama is running: `ollama serve`"
             self.add_message("assistant", error_msg)
     
+    async def _get_ai_response_async(self, user_message: str):
+        """Async worker for AI response"""
+        try:
+            system_prompt = """You are GPT OSS, an AI assistant integrated into a powerful development toolkit. You can help with:
+
+1. **File Operations**: Finding, reading, and analyzing files
+2. **Code Search**: Searching through codebases and finding patterns  
+3. **Project Analysis**: Understanding project structure and dependencies
+4. **Tool Execution**: Running development tools and commands
+
+Available tools in this environment:
+- `glop <pattern>` - Find files by pattern (e.g., "*.py", "*.js")
+- `grep <query>` - Search file contents for text patterns
+- `search <query>` - Semantic search through indexed files
+- `read <file>` - Display file contents with syntax highlighting
+- `readymyfiles` - Prepare files for AI analysis
+- `filewrite` - Create and edit files
+
+When users ask you to perform actions, suggest specific tool commands or execute them if requested. Be helpful, practical, and focus on developer productivity.
+
+User message: """
+            
+            # Call Ollama API asynchronously
+            response = await self._call_ollama_async(system_prompt + user_message)
+            
+            # Remove typing indicator and add real response
+            chat_history = self.query_one("#chat_history", ScrollableContainer)
+            if chat_history.children:
+                chat_history.children[-1].remove()
+            
+            self.add_message("assistant", response)
+            
+            # Check if response contains tool suggestions
+            self._handle_tool_suggestions(response)
+            
+        except Exception as e:
+            # Remove typing indicator
+            chat_history = self.query_one("#chat_history", ScrollableContainer)
+            if chat_history.children:
+                chat_history.children[-1].remove()
+            
+            error_msg = f"❌ Error: {str(e)}\n\nMake sure Ollama is running: `ollama serve`"
+            self.add_message("assistant", error_msg)
+    
+    async def _call_ollama_async(self, prompt: str) -> str:
+        """Async call to Ollama API"""
+        import aiohttp
+        import asyncio
+        
+        data = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": False,  # Keep it simple for now
+            "options": {
+                "temperature": 0.8,
+                "max_tokens": 128000
+            }
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.ollama_url, json=data, timeout=90) as response:
+                result = await response.json()
+                
+                # Extract thinking and send to ThinkingPanel
+                thinking = result.get("thinking", "")
+                if thinking.strip():
+                    thinking_panel = self.query_one("#thinking_panel", ThinkingPanel)
+                    thinking_panel.add_thinking(thinking)
+                
+                return result.get("response", "No response generated")
+    
     def _call_ollama(self, prompt: str) -> str:
         """Call Ollama API synchronously"""
         import requests
@@ -171,8 +262,7 @@ class ChatPanel(Container):
             }
         }
         
-        # Define stream variable to match the parameter in the request
-        response = requests.post(self.ollama_url, json=data, stream=True, timeout=90)
+        response = requests.post(self.ollama_url, json=data, timeout=90)
         response.raise_for_status()
         
         result = response.json()
@@ -185,11 +275,121 @@ class ChatPanel(Container):
         
         return result.get("response", "No response generated")
     
-    def _call_ollama_with_tools(self, user_message: str) -> str:
-        """Call Ollama using Chat Completions format with tools"""
-        import requests
+    def _call_ollama_with_file_read(self, user_message: str) -> str:
+        """Simple file read tool using OpenAI SDK format"""
+        from openai import OpenAI
         
-        # Define tools using OpenAI function calling format
+        # Initialize OpenAI client pointing to Ollama
+        client = OpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="ollama"
+        )
+        
+        # Define just the file_read tool
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "file_read",
+                    "description": "Read contents of a file with syntax highlighting",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {
+                                "type": "string",
+                                "description": "Name or path of file to read"
+                            }
+                        },
+                        "required": ["filename"]
+                    }
+                }
+            }
+        ]
+        
+        # Also get thinking content
+        self._get_thinking_for_message(user_message)
+        
+        # Call using OpenAI SDK format  
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are GPT OSS, an AI assistant. Use the file_read function to read files when requested."},
+                {"role": "user", "content": user_message}
+            ],
+            tools=tools
+        )
+        
+        message = response.choices[0].message
+        
+        # Check for tool calls
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "file_read":
+                    import json
+                    args = json.loads(tool_call.function.arguments)
+                    filename = args.get("filename")
+                    result = self._execute_read_tool(filename)
+                    return f"{message.content or ''}\n\n**File Contents:**\n{result}"
+        
+        return message.content or "No response generated"
+
+    def _execute_read_tool(self, filename: str) -> str:
+        """Execute the read tool"""
+        try:
+            tools_dir = Path(__file__).parent
+            cmd = ["./read", filename]
+            
+            result = subprocess.run(
+                cmd,
+                cwd=tools_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                return f"```\n{result.stdout}\n```"
+            else:
+                return f"❌ Error reading {filename}:\n```\n{result.stderr}\n```"
+                
+        except Exception as e:
+            return f"❌ Failed to read {filename}: {str(e)}"
+
+    def _get_thinking_for_message(self, user_message: str):
+        """Get thinking content from /api/generate endpoint"""
+        try:
+            system_prompt = """You are GPT OSS, an AI assistant. The user is asking about files. Think through what they need."""
+            
+            data = {
+                "model": self.model,
+                "prompt": system_prompt + user_message,
+                "stream": False,
+                "options": {"temperature": 0.7}
+            }
+            
+            response = requests.post(self.ollama_url, json=data, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            thinking = result.get("thinking", "")
+            if thinking.strip():
+                thinking_panel = self.app.query_one("#thinking_panel", ThinkingPanel)
+                thinking_panel.add_thinking(thinking)
+                
+        except Exception as e:
+            print(f"Error getting thinking: {e}")
+
+    def _call_ollama_with_tools(self, user_message: str) -> str:
+        """Call Ollama using proper OpenAI SDK format as per documentation"""
+        from openai import OpenAI
+        
+        # Initialize OpenAI client pointing to Ollama
+        client = OpenAI(
+            base_url="http://localhost:11434/v1",  # Local Ollama API
+            api_key="ollama"                       # Dummy key
+        )
+        
+        # Define tools exactly like the documentation example
         tools = [
             {
                 "type": "function",
@@ -215,51 +415,41 @@ class ChatPanel(Container):
             }
         ]
         
-        # Use Chat Completions API format 
-        messages = [
-            {
-                "role": "system",
-                "content": "You are GPT OSS, an AI development assistant. Use the file_operations function to help users find, read, and search files. When users ask for file operations, call the appropriate function."
-            },
-            {
-                "role": "user", 
-                "content": user_message
-            }
-        ]
+        # Call using OpenAI SDK format
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are GPT OSS, an AI development assistant. Use the file_operations function to help users find, read, and search files."},
+                {"role": "user", "content": user_message}
+            ],
+            tools=tools
+        )
         
-        data = {
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "stream": False,
-            "options": {
-                "temperature": 0.8,
-                "max_tokens": 128000
-            }
-        }
+        message = response.choices[0].message
         
-        # Use chat endpoint for tool calling
-        response = requests.post("http://localhost:11434/v1/chat/completions", json=data, timeout=90)
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        # Handle tool calls
-        message = result.get("choices", [{}])[0].get("message", {})
-        
-        # Extract thinking if present
-        if "thinking" in result:
-            thinking = result.get("thinking", "")
-            if thinking.strip():
-                thinking_panel = self.app.query_one("#thinking_panel", ThinkingPanel)
-                thinking_panel.add_thinking(thinking)
+        # Get thinking by making a parallel call to the thinking endpoint
+        self._get_thinking_for_message(user_message)
         
         # Check for tool calls
-        tool_calls = message.get("tool_calls", [])
-        if tool_calls:
-            return self._handle_tool_calls(tool_calls, message)
+        if message.tool_calls:
+            # Execute tool calls and get results
+            tool_results = []
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "file_operations":
+                    import json
+                    args = json.loads(tool_call.function.arguments)
+                    result = self._execute_file_operation(args.get("operation"), args.get("query"))
+                    tool_results.append(f"**{args.get('operation').title()} Results:**\n{result}")
+            
+            # Return tool results - the model's reasoning should be in message.content
+            if message.content and tool_results:
+                return f"{message.content}\n\n" + "\n\n".join(tool_results)
+            elif tool_results:
+                return "\n\n".join(tool_results)
+            else:
+                return message.content or "Tool executed successfully"
         else:
-            return message.get("content", "No response generated")
+            return message.content or "No response generated"
     
     def _call_ollama_simple(self, user_message: str) -> str:
         """Fallback to original working format"""
@@ -280,6 +470,48 @@ When users ask you to perform actions, suggest specific tool commands or execute
 User message: """
         
         # Use original working API format
+        return self._call_ollama(system_prompt + user_message)
+    
+    def _should_use_tools(self, user_message: str) -> bool:
+        """Check if message looks like it needs tool execution"""
+        tool_keywords = [
+            "find", "search", "read", "show", "list", "get", "analyze", 
+            "python files", "config", "structure", "codebase", "files"
+        ]
+        message_lower = user_message.lower()
+        return any(keyword in message_lower for keyword in tool_keywords)
+    
+    def _execute_tool_from_message(self, user_message: str) -> str:
+        """Execute tool based on natural language message"""
+        message_lower = user_message.lower()
+        
+        if "find" in message_lower and "python" in message_lower:
+            return self._execute_file_operation("find", "*.py")
+        elif "config" in message_lower and ("show" in message_lower or "read" in message_lower):
+            return self._execute_file_operation("read", "config.yaml")
+        elif "analyze" in message_lower and "codebase" in message_lower:
+            return self._execute_file_operation("analyze", "")
+        elif "search" in message_lower:
+            # Extract search term after "search"
+            words = user_message.split()
+            search_term = " ".join(words[words.index("search")+1:]) if "search" in words else user_message
+            return self._execute_file_operation("search", search_term)
+        
+        return ""
+    
+    def _call_ollama_with_context(self, user_message: str, tool_results: str) -> str:
+        """Call ollama with tool results context - preserves thinking"""
+        system_prompt = f"""You are GPT OSS, an AI development assistant. 
+
+The user asked: "{user_message}"
+
+I executed the appropriate tool and got these results:
+{tool_results}
+
+Please provide a helpful response based on these results. Be concise and highlight the key findings.
+
+User message: """
+        
         return self._call_ollama(system_prompt + user_message)
     
     def _handle_tool_calls(self, tool_calls: list, message: dict) -> str:
@@ -409,6 +641,96 @@ User message: """
 Just ask naturally - I'll suggest the right tools!"""
         
         self.add_message("assistant", tools_help)
+    
+    def _call_ollama_with_file_read_working(self, user_message: str) -> str:
+        """Working file read tool using OpenAI SDK format - from interactive version"""
+        from openai import OpenAI
+        
+        # Initialize OpenAI client pointing to Ollama
+        client = OpenAI(
+            base_url="http://localhost:11434/v1",
+            api_key="ollama"
+        )
+        
+        # Define just the file_read tool
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "file_read",
+                    "description": "Read contents of a file with syntax highlighting",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {
+                                "type": "string",
+                                "description": "Name or path of file to read"
+                            }
+                        },
+                        "required": ["filename"]
+                    }
+                }
+            }
+        ]
+        
+        # Create simple conversation for this request
+        messages = [
+            {"role": "system", "content": "You are GPT OSS, an AI assistant. Use the file_read function to read files when requested."},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # Call GPT-OSS with tools
+        response = client.chat.completions.create(
+            model="gpt-oss:20b",
+            messages=messages,
+            tools=tools
+        )
+        
+        message = response.choices[0].message
+        assistant_content = message.content or ""
+        
+        # Handle tool calls
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                if tool_call.function.name == "file_read":
+                    import json
+                    args = json.loads(tool_call.function.arguments)
+                    filename = args.get("filename")
+                    result = self._execute_read_tool_simple(filename)
+                    return f"{assistant_content}\n\n**File Contents:**\n{result}"
+        
+        return assistant_content or "No response generated"
+    
+    def _should_use_file_read_tool(self, user_message: str) -> bool:
+        """Check if message looks like it needs file reading"""
+        file_read_keywords = [
+            "read", "show", "display", "view", "open", "contents", "content",
+            "file", ".txt", ".py", ".md", ".yaml", ".json", ".js", ".ts"
+        ]
+        message_lower = user_message.lower()
+        return any(keyword in message_lower for keyword in file_read_keywords)
+    
+    def _execute_read_tool_simple(self, filename: str) -> str:
+        """Execute the read tool - simple version"""
+        try:
+            tools_dir = Path(__file__).parent
+            cmd = ["./read", filename]
+            
+            result = subprocess.run(
+                cmd,
+                cwd=tools_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                return f"```\n{result.stdout}\n```"
+            else:
+                return f"❌ Error reading {filename}:\n```\n{result.stderr}\n```"
+                
+        except Exception as e:
+            return f"❌ Failed to read {filename}: {str(e)}"
 
 
 class FileExplorer(Container):
