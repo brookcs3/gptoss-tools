@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+READ - Smart file reading tool for GPT OSS workflows
+
+Usage:
+    ./read main.py --syntax
+    ./read config.yaml --lines=50
+    ./read *.md --summary
+"""
+
+import os
+import sys
+import argparse
+from pathlib import Path
+from typing import List, Optional, Dict
+import yaml
+
+class ReadTool:
+    def __init__(self, config_path: str = None):
+        self.config = self.load_config(config_path)
+        self.syntax_highlighting = self.config.get('tools', {}).get('read', {}).get('syntax_highlighting', True)
+        self.line_numbers = self.config.get('tools', {}).get('read', {}).get('line_numbers', True)
+        self.max_lines = self.config.get('tools', {}).get('read', {}).get('max_lines', 500)
+        
+    def load_config(self, config_path: str = None) -> dict:
+        """Load configuration from YAML file"""
+        if config_path is None:
+            config_path = Path(__file__).parent / "config.yaml"
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def detect_file_type(self, file_path: Path) -> str:
+        """Detect file type based on extension and content"""
+        extension = file_path.suffix.lower()
+        
+        # Common programming languages
+        type_map = {
+            '.py': 'python',
+            '.js': 'javascript',
+            '.ts': 'typescript',
+            '.tsx': 'typescript',
+            '.jsx': 'javascript',
+            '.java': 'java',
+            '.cpp': 'cpp',
+            '.c': 'c',
+            '.h': 'c',
+            '.hpp': 'cpp',
+            '.cs': 'csharp',
+            '.go': 'go',
+            '.rs': 'rust',
+            '.php': 'php',
+            '.rb': 'ruby',
+            '.swift': 'swift',
+            '.kt': 'kotlin',
+            '.scala': 'scala',
+            '.sh': 'bash',
+            '.bash': 'bash',
+            '.zsh': 'bash',
+            '.fish': 'bash',
+            '.ps1': 'powershell',
+            
+            # Markup and config
+            '.html': 'html',
+            '.htm': 'html',
+            '.xml': 'xml',
+            '.css': 'css',
+            '.scss': 'scss',
+            '.sass': 'sass',
+            '.less': 'less',
+            '.md': 'markdown',
+            '.markdown': 'markdown',
+            '.rst': 'rst',
+            '.json': 'json',
+            '.yaml': 'yaml',
+            '.yml': 'yaml',
+            '.toml': 'toml',
+            '.ini': 'ini',
+            '.cfg': 'ini',
+            '.conf': 'ini',
+            
+            # Data
+            '.sql': 'sql',
+            '.csv': 'csv',
+            '.tsv': 'csv',
+            
+            # Other
+            '.dockerfile': 'dockerfile',
+            '.makefile': 'makefile',
+            '.gitignore': 'gitignore',
+            '.txt': 'text',
+            '.log': 'text'
+        }
+        
+        file_type = type_map.get(extension, 'text')
+        
+        # Special handling for files without extensions
+        if extension == '':
+            name_lower = file_path.name.lower()
+            if name_lower in ['dockerfile', 'makefile', 'rakefile']:
+                return name_lower
+            elif name_lower.startswith('makefile'):
+                return 'makefile'
+        
+        return file_type
+    
+    def get_syntax_highlighter(self, file_type: str):
+        """Get syntax highlighter for file type"""
+        try:
+            from pygments import highlight
+            from pygments.lexers import get_lexer_by_name, TextLexer
+            from pygments.formatters import TerminalFormatter
+            
+            try:
+                lexer = get_lexer_by_name(file_type)
+            except:
+                lexer = TextLexer()
+            
+            formatter = TerminalFormatter()
+            return lambda code: highlight(code, lexer, formatter)
+        except ImportError:
+            # Fallback: no syntax highlighting
+            return lambda code: code
+    
+    def read_file(self, file_path: Path, max_lines: int = None, 
+                  syntax: bool = None, line_numbers: bool = None,
+                  start_line: int = 1, encoding: str = 'utf-8') -> Dict:
+        """Read file with optional syntax highlighting and line numbers"""
+        if not file_path.exists():
+            return {'error': f"File {file_path} does not exist"}
+        
+        if not file_path.is_file():
+            return {'error': f"{file_path} is not a file"}
+        
+        # Use defaults from config if not specified
+        if max_lines is None:
+            max_lines = self.max_lines
+        if syntax is None:
+            syntax = self.syntax_highlighting
+        if line_numbers is None:
+            line_numbers = self.line_numbers
+        
+        try:
+            # Try to read with specified encoding
+            with open(file_path, 'r', encoding=encoding, errors='replace') as f:
+                lines = f.readlines()
+        except UnicodeDecodeError:
+            # Try with different encoding
+            try:
+                with open(file_path, 'r', encoding='latin1', errors='replace') as f:
+                    lines = f.readlines()
+            except:
+                return {'error': f"Could not read file {file_path} - unsupported encoding"}
+        except OSError as e:
+            return {'error': f"Error reading file {file_path}: {e}"}
+        
+        # Handle line range
+        total_lines = len(lines)
+        end_line = min(start_line + max_lines - 1, total_lines) if max_lines else total_lines
+        selected_lines = lines[start_line-1:end_line]
+        
+        # Prepare content
+        content = ''.join(selected_lines)
+        
+        # Get file info
+        file_stat = file_path.stat()
+        file_info = {
+            'path': str(file_path),
+            'size': file_stat.st_size,
+            'total_lines': total_lines,
+            'shown_lines': len(selected_lines),
+            'line_range': f"{start_line}-{start_line + len(selected_lines) - 1}",
+            'truncated': end_line < total_lines,
+            'file_type': self.detect_file_type(file_path)
+        }
+        
+        # Apply syntax highlighting
+        if syntax and content.strip():
+            highlighter = self.get_syntax_highlighter(file_info['file_type'])
+            content = highlighter(content)
+        
+        # Add line numbers
+        if line_numbers:
+            content_lines = content.split('\\n')
+            numbered_lines = []
+            for i, line in enumerate(content_lines):
+                line_num = start_line + i
+                if line_num <= total_lines:  # Don't number empty lines beyond file
+                    numbered_lines.append(f"{line_num:4d}: {line}")
+                else:
+                    numbered_lines.append(line)
+            content = '\\n'.join(numbered_lines)
+        
+        return {
+            'content': content,
+            'info': file_info
+        }
+    
+    def get_file_summary(self, file_path: Path) -> Dict:
+        """Get a summary of the file without reading full content"""
+        if not file_path.exists():
+            return {'error': f"File {file_path} does not exist"}
+        
+        try:
+            file_stat = file_path.stat()
+            file_type = self.detect_file_type(file_path)
+            
+            # Read first few lines for preview
+            preview_lines = []
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    for i, line in enumerate(f):
+                        if i >= 5:  # First 5 lines
+                            break
+                        preview_lines.append(line.rstrip())
+            except:
+                preview_lines = ["<binary or unreadable file>"]
+            
+            # Count lines
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    line_count = sum(1 for _ in f)
+            except:
+                line_count = "unknown"
+            
+            return {
+                'path': str(file_path),
+                'type': file_type,
+                'size': file_stat.st_size,
+                'size_human': self.format_size(file_stat.st_size),
+                'lines': line_count,
+                'modified': file_stat.st_mtime,
+                'preview': preview_lines
+            }
+        except OSError as e:
+            return {'error': f"Error accessing file {file_path}: {e}"}
+    
+    def format_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f}{unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f}TB"
+    
+    def format_output(self, result: Dict, show_info: bool = True) -> str:
+        """Format read result for output"""
+        if 'error' in result:
+            return f"Error: {result['error']}"
+        
+        lines = []
+        
+        # Show file info header
+        if show_info and 'info' in result:
+            info = result['info']
+            lines.append(f"File: {info['path']}")
+            lines.append(f"Type: {info['file_type']}")
+            lines.append(f"Size: {self.format_size(info['size'])}")
+            lines.append(f"Lines: {info['shown_lines']}/{info['total_lines']} ({info['line_range']})")
+            if info['truncated']:
+                lines.append("Note: Output truncated")
+            lines.append("-" * 60)
+        
+        # Add content
+        if 'content' in result:
+            lines.append(result['content'])
+        
+        return '\\n'.join(lines)
+    
+    def format_summary(self, summary: Dict) -> str:
+        """Format file summary for output"""
+        if 'error' in summary:
+            return f"Error: {summary['error']}"
+        
+        import datetime
+        
+        lines = [
+            f"Path: {summary['path']}",
+            f"Type: {summary['type']}",
+            f"Size: {summary['size_human']} ({summary['size']} bytes)",
+            f"Lines: {summary['lines']}",
+        ]
+        
+        if 'modified' in summary:
+            mtime = datetime.datetime.fromtimestamp(summary['modified'])
+            lines.append(f"Modified: {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        if summary.get('preview'):
+            lines.append("\\nPreview:")
+            for i, line in enumerate(summary['preview'], 1):
+                lines.append(f"  {i}: {line[:80]}{'...' if len(line) > 80 else ''}")
+        
+        return '\\n'.join(lines)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="READ - Smart file reading for GPT OSS workflows",
+        epilog="""
+Examples:
+  %(prog)s main.py --syntax --lines=100
+  %(prog)s config.yaml --no-line-numbers
+  %(prog)s *.md --summary
+  %(prog)s large_file.txt --start=100 --lines=50
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument("files", nargs="+", help="Files to read")
+    
+    # Display options
+    parser.add_argument("-s", "--syntax", action="store_true",
+                       help="Enable syntax highlighting")
+    parser.add_argument("--no-syntax", action="store_true",
+                       help="Disable syntax highlighting")
+    parser.add_argument("-n", "--line-numbers", action="store_true",
+                       help="Show line numbers")
+    parser.add_argument("--no-line-numbers", action="store_true",
+                       help="Hide line numbers")
+    parser.add_argument("--no-info", action="store_true",
+                       help="Hide file information header")
+    
+    # Content options
+    parser.add_argument("-l", "--lines", type=int,
+                       help="Maximum number of lines to read")
+    parser.add_argument("--start", type=int, default=1,
+                       help="Starting line number")
+    parser.add_argument("-e", "--encoding", default="utf-8",
+                       help="File encoding")
+    
+    # Mode options
+    parser.add_argument("--summary", action="store_true",
+                       help="Show file summary instead of content")
+    
+    # Config
+    parser.add_argument("--config", help="Path to config file")
+    
+    args = parser.parse_args()
+    
+    # Initialize tool
+    read_tool = ReadTool(args.config)
+    
+    # Resolve file arguments (handle globs)
+    file_paths = []
+    for file_arg in args.files:
+        paths = list(Path(".").glob(file_arg))
+        if paths:
+            file_paths.extend(paths)
+        else:
+            # Not a glob, treat as literal path
+            file_paths.append(Path(file_arg))
+    
+    # Determine settings
+    syntax = args.syntax if args.syntax else not args.no_syntax
+    if not args.syntax and not args.no_syntax:
+        syntax = read_tool.syntax_highlighting
+    
+    line_numbers = args.line_numbers if args.line_numbers else not args.no_line_numbers
+    if not args.line_numbers and not args.no_line_numbers:
+        line_numbers = read_tool.line_numbers
+    
+    max_lines = args.lines if args.lines else read_tool.max_lines
+    
+    try:
+        for i, file_path in enumerate(file_paths):
+            if i > 0:
+                print("\\n" + "=" * 80 + "\\n")
+            
+            if args.summary:
+                # Show summary
+                summary = read_tool.get_file_summary(file_path)
+                output = read_tool.format_summary(summary)
+            else:
+                # Read file content
+                result = read_tool.read_file(
+                    file_path,
+                    max_lines=max_lines,
+                    syntax=syntax,
+                    line_numbers=line_numbers,
+                    start_line=args.start,
+                    encoding=args.encoding
+                )
+                output = read_tool.format_output(result, show_info=not args.no_info)
+            
+            print(output)
+        
+        sys.exit(0)
+        
+    except KeyboardInterrupt:
+        print("\\nReading interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

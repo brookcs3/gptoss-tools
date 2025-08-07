@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""
+READYMYFILES - File preparation and organization tool for GPT OSS workflows
+
+Usage:
+    ./readymyfiles prepare-for-ai --include="*.py" --bundle-size=10
+    ./readymyfiles create-context ./src --output=context.md
+    ./readymyfiles analyze-codebase --report
+"""
+
+import os
+import sys
+import argparse
+import json
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import yaml
+import datetime
+import hashlib
+
+class ReadyMyFilesTool:
+    def __init__(self, config_path: str = None):
+        self.config = self.load_config(config_path)
+        self.output_dir = Path(self.config.get('tools', {}).get('readymyfiles', {}).get('output_directory', 'prepared-files'))
+        self.max_files_per_bundle = self.config.get('tools', {}).get('readymyfiles', {}).get('max_files_per_bundle', 50)
+        self.include_metadata = self.config.get('tools', {}).get('readymyfiles', {}).get('include_metadata', True)
+        
+    def load_config(self, config_path: str = None) -> dict:
+        """Load configuration from YAML file"""
+        if config_path is None:
+            config_path = Path(__file__).parent / "config.yaml"
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def get_file_metadata(self, file_path: Path) -> Dict:
+        """Extract metadata from a file"""
+        try:
+            stat = file_path.stat()
+            
+            # Detect file type
+            file_type = self.detect_file_type(file_path)
+            
+            # Count lines for text files
+            line_count = None
+            if file_type in ['code', 'config', 'docs']:
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        line_count = sum(1 for _ in f)
+                except:
+                    pass
+            
+            return {
+                'path': str(file_path),
+                'name': file_path.name,
+                'size': stat.st_size,
+                'size_human': self.format_size(stat.st_size),
+                'modified': stat.st_mtime,
+                'modified_human': datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                'type': file_type,
+                'extension': file_path.suffix,
+                'lines': line_count
+            }
+        except OSError:
+            return {'error': f"Could not access {file_path}"}
+    
+    def detect_file_type(self, file_path: Path) -> str:
+        """Detect file type based on extension"""
+        extension = file_path.suffix.lower()
+        
+        file_types = self.config.get('file_types', {})
+        
+        for type_name, extensions in file_types.items():
+            if extension in extensions:
+                return type_name
+        
+        return 'other'
+    
+    def format_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f}{unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f}TB"
+    
+    def should_include_file(self, file_path: Path, include_patterns: List[str] = None,
+                           exclude_patterns: List[str] = None, file_types: List[str] = None) -> bool:
+        """Check if file should be included based on patterns and types"""
+        import fnmatch
+        
+        # Check include patterns
+        if include_patterns:
+            matches_include = False
+            for pattern in include_patterns:
+                if fnmatch.fnmatch(str(file_path), pattern) or fnmatch.fnmatch(file_path.name, pattern):
+                    matches_include = True
+                    break
+            if not matches_include:
+                return False
+        
+        # Check exclude patterns
+        if exclude_patterns:
+            for pattern in exclude_patterns:
+                if fnmatch.fnmatch(str(file_path), pattern) or fnmatch.fnmatch(file_path.name, pattern):
+                    return False
+        
+        # Check file types
+        if file_types:
+            detected_type = self.detect_file_type(file_path)
+            if detected_type not in file_types:
+                return False
+        
+        # Skip common unwanted files
+        if file_path.name.startswith('.') or file_path.name.endswith('~'):
+            return False
+        
+        unwanted_dirs = {'__pycache__', 'node_modules', '.git', '.svn', '.hg', 'build', 'dist'}
+        if any(part in unwanted_dirs for part in file_path.parts):
+            return False
+        
+        return True
+    
+    def collect_files(self, directory: Path, include_patterns: List[str] = None,
+                     exclude_patterns: List[str] = None, file_types: List[str] = None,
+                     recursive: bool = True) -> List[Path]:
+        """Collect files based on criteria"""
+        files = []
+        
+        if recursive:
+            file_iterator = directory.rglob("*")
+        else:
+            file_iterator = directory.glob("*")
+        
+        for file_path in file_iterator:
+            if file_path.is_file() and self.should_include_file(
+                file_path, include_patterns, exclude_patterns, file_types
+            ):
+                files.append(file_path)
+        
+        return sorted(files)
+    
+    def create_file_bundle(self, files: List[Path], bundle_name: str, 
+                          include_content: bool = True) -> Dict:
+        """Create a bundle of files with optional content"""
+        bundle = {
+            'name': bundle_name,
+            'created': datetime.datetime.now().isoformat(),
+            'file_count': len(files),
+            'files': []
+        }
+        
+        total_size = 0
+        
+        for file_path in files:
+            file_info = self.get_file_metadata(file_path)
+            if 'error' in file_info:
+                continue
+            
+            file_entry = file_info.copy()
+            
+            if include_content:
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    file_entry['content'] = content
+                    file_entry['content_hash'] = hashlib.md5(content.encode()).hexdigest()
+                except OSError:
+                    file_entry['content'] = None
+                    file_entry['error'] = "Could not read file content"
+            
+            bundle['files'].append(file_entry)
+            total_size += file_info.get('size', 0)
+        
+        bundle['total_size'] = total_size
+        bundle['total_size_human'] = self.format_size(total_size)
+        
+        return bundle
+    
+    def create_context_document(self, files: List[Path], title: str = "Codebase Context") -> str:
+        """Create a context document for AI analysis"""
+        lines = []
+        
+        # Header
+        lines.extend([
+            f"# {title}",
+            "",
+            f"*Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*",
+            "",
+            f"This document contains {len(files)} files prepared for GPT OSS analysis.",
+            "",
+            "## File Structure",
+            ""
+        ])
+        
+        # File listing with metadata
+        for file_path in files:
+            metadata = self.get_file_metadata(file_path)
+            if 'error' in metadata:
+                continue
+            
+            lines.append(f"- **{metadata['path']}** ({metadata['type']}) - {metadata['size_human']}")
+            if metadata.get('lines'):
+                lines[-1] += f", {metadata['lines']} lines"
+        
+        lines.extend(["", "## File Contents", ""])
+        
+        # File contents
+        for i, file_path in enumerate(files, 1):
+            metadata = self.get_file_metadata(file_path)
+            if 'error' in metadata:
+                continue
+            
+            lines.extend([
+                f"### {i}. {metadata['path']}",
+                "",
+                f"**Type:** {metadata['type']}  ",
+                f"**Size:** {metadata['size_human']}  ",
+                f"**Modified:** {metadata['modified_human']}  ",
+            ])
+            
+            if metadata.get('lines'):
+                lines.append(f"**Lines:** {metadata['lines']}  ")
+            
+            lines.append("")
+            
+            # Add file content
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                # Determine language for syntax highlighting
+                file_type = metadata['type']
+                extension = metadata['extension']
+                
+                lang_map = {
+                    '.py': 'python',
+                    '.js': 'javascript',
+                    '.ts': 'typescript',
+                    '.java': 'java',
+                    '.cpp': 'cpp',
+                    '.c': 'c',
+                    '.go': 'go',
+                    '.rs': 'rust',
+                    '.php': 'php',
+                    '.rb': 'ruby',
+                    '.sh': 'bash',
+                    '.yaml': 'yaml',
+                    '.yml': 'yaml',
+                    '.json': 'json',
+                    '.md': 'markdown',
+                    '.html': 'html',
+                    '.css': 'css'
+                }
+                
+                lang = lang_map.get(extension, 'text')
+                
+                lines.extend([
+                    f"```{lang}",
+                    content,
+                    "```",
+                    ""
+                ])
+                
+            except OSError:
+                lines.extend([
+                    "*Could not read file content*",
+                    ""
+                ])
+        
+        return "\\n".join(lines)
+    
+    def analyze_codebase(self, directory: Path, recursive: bool = True) -> Dict:
+        """Analyze a codebase and generate statistics"""
+        files = self.collect_files(directory, recursive=recursive)
+        
+        analysis = {
+            'directory': str(directory),
+            'analyzed_at': datetime.datetime.now().isoformat(),
+            'total_files': len(files),
+            'file_types': {},
+            'size_by_type': {},
+            'lines_by_type': {},
+            'largest_files': [],
+            'most_lines': [],
+            'languages': set(),
+            'total_size': 0,
+            'total_lines': 0
+        }
+        
+        for file_path in files:
+            metadata = self.get_file_metadata(file_path)
+            if 'error' in metadata:
+                continue
+            
+            file_type = metadata['type']
+            size = metadata['size']
+            lines = metadata.get('lines') or 0  # Handle None case
+            
+            # Update counters
+            analysis['file_types'][file_type] = analysis['file_types'].get(file_type, 0) + 1
+            analysis['size_by_type'][file_type] = analysis['size_by_type'].get(file_type, 0) + size
+            analysis['lines_by_type'][file_type] = analysis['lines_by_type'].get(file_type, 0) + lines
+            analysis['total_size'] += size
+            analysis['total_lines'] += lines
+            
+            # Track languages
+            if file_type == 'code':
+                extension = metadata['extension']
+                if extension:
+                    analysis['languages'].add(extension)
+            
+            # Track largest files
+            analysis['largest_files'].append((str(file_path), size))
+            if lines > 0:
+                analysis['most_lines'].append((str(file_path), lines))
+        
+        # Sort and limit top lists
+        analysis['largest_files'].sort(key=lambda x: x[1], reverse=True)
+        analysis['largest_files'] = analysis['largest_files'][:10]
+        
+        analysis['most_lines'].sort(key=lambda x: x[1], reverse=True)
+        analysis['most_lines'] = analysis['most_lines'][:10]
+        
+        # Convert languages set to sorted list
+        analysis['languages'] = sorted(list(analysis['languages']))
+        
+        # Add human-readable sizes
+        analysis['total_size_human'] = self.format_size(analysis['total_size'])
+        
+        return analysis
+    
+    def generate_analysis_report(self, analysis: Dict) -> str:
+        """Generate a human-readable analysis report"""
+        lines = [
+            "# Codebase Analysis Report",
+            "",
+            f"**Directory:** {analysis['directory']}  ",
+            f"**Analyzed:** {analysis['analyzed_at']}  ",
+            f"**Total Files:** {analysis['total_files']}  ",
+            f"**Total Size:** {analysis['total_size_human']}  ",
+            f"**Total Lines:** {analysis['total_lines']:,}  ",
+            "",
+            "## File Types",
+            ""
+        ]
+        
+        # File type breakdown
+        for file_type, count in sorted(analysis['file_types'].items()):
+            size = analysis['size_by_type'].get(file_type, 0)
+            lines_count = analysis['lines_by_type'].get(file_type, 0)
+            lines.append(f"- **{file_type}**: {count} files, {self.format_size(size)}, {lines_count:,} lines")
+        
+        lines.extend(["", "## Programming Languages", ""])
+        
+        if analysis['languages']:
+            for lang in analysis['languages']:
+                lines.append(f"- {lang}")
+        else:
+            lines.append("*No programming languages detected*")
+        
+        lines.extend(["", "## Largest Files", ""])
+        
+        for path, size in analysis['largest_files']:
+            lines.append(f"- {path} ({self.format_size(size)})")
+        
+        if analysis['most_lines']:
+            lines.extend(["", "## Files with Most Lines", ""])
+            
+            for path, line_count in analysis['most_lines']:
+                lines.append(f"- {path} ({line_count:,} lines)")
+        
+        return "\\n".join(lines)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="READYMYFILES - File preparation for GPT OSS workflows",
+        epilog="""
+Examples:
+  %(prog)s prepare-for-ai --include="*.py" --bundle-size=10
+  %(prog)s create-context ./src --output=context.md
+  %(prog)s analyze-codebase --directory=./project --report
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # Prepare for AI command
+    prepare_parser = subparsers.add_parser("prepare-for-ai", help="Prepare files for AI analysis")
+    prepare_parser.add_argument("directory", nargs="?", default=".", help="Directory to prepare")
+    prepare_parser.add_argument("--include", action="append", default=[], help="Include file patterns")
+    prepare_parser.add_argument("--exclude", action="append", default=[], help="Exclude file patterns")
+    prepare_parser.add_argument("--types", action="append", default=[], help="Include file types")
+    prepare_parser.add_argument("--bundle-size", type=int, default=10, help="Files per bundle")
+    prepare_parser.add_argument("--no-content", action="store_true", help="Don't include file content")
+    prepare_parser.add_argument("--output", help="Output directory")
+    
+    # Create context command
+    context_parser = subparsers.add_parser("create-context", help="Create context document")
+    context_parser.add_argument("directory", nargs="?", default=".", help="Directory to process")
+    context_parser.add_argument("--include", action="append", default=[], help="Include file patterns")
+    context_parser.add_argument("--exclude", action="append", default=[], help="Exclude file patterns")
+    context_parser.add_argument("--types", action="append", default=[], help="Include file types")
+    context_parser.add_argument("--output", default="context.md", help="Output file")
+    context_parser.add_argument("--title", help="Document title")
+    
+    # Analyze codebase command
+    analyze_parser = subparsers.add_parser("analyze-codebase", help="Analyze codebase structure")
+    analyze_parser.add_argument("directory", nargs="?", default=".", help="Directory to analyze")
+    analyze_parser.add_argument("--report", action="store_true", help="Generate readable report")
+    analyze_parser.add_argument("--output", help="Output file for analysis")
+    
+    # Global options
+    parser.add_argument("--config", help="Path to config file")
+    parser.add_argument("--recursive", action="store_true", default=True, help="Process recursively")
+    parser.add_argument("--no-recursive", action="store_true", help="Don't process recursively")
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
+    # Initialize tool
+    ready_tool = ReadyMyFilesTool(args.config)
+    
+    # Handle recursive flag
+    recursive = args.recursive and not args.no_recursive
+    
+    try:
+        if args.command == "prepare-for-ai":
+            directory = Path(args.directory)
+            if not directory.exists():
+                print(f"Error: Directory {directory} does not exist", file=sys.stderr)
+                sys.exit(1)
+            
+            # Collect files
+            files = ready_tool.collect_files(
+                directory,
+                include_patterns=args.include if args.include else None,
+                exclude_patterns=args.exclude if args.exclude else None,
+                file_types=args.types if args.types else None,
+                recursive=recursive
+            )
+            
+            if not files:
+                print("No files found matching criteria.")
+                sys.exit(0)
+            
+            print(f"Found {len(files)} files to prepare.")
+            
+            # Create output directory
+            output_dir = Path(args.output) if args.output else ready_tool.output_dir
+            output_dir.mkdir(exist_ok=True)
+            
+            # Create bundles
+            bundle_size = args.bundle_size or ready_tool.max_files_per_bundle
+            bundles_created = 0
+            
+            for i in range(0, len(files), bundle_size):
+                bundle_files = files[i:i + bundle_size]
+                bundle_name = f"bundle_{bundles_created + 1:03d}"
+                
+                bundle = ready_tool.create_file_bundle(
+                    bundle_files,
+                    bundle_name,
+                    include_content=not args.no_content
+                )
+                
+                # Save bundle
+                bundle_path = output_dir / f"{bundle_name}.json"
+                with open(bundle_path, 'w') as f:
+                    json.dump(bundle, f, indent=2)
+                
+                print(f"Created bundle: {bundle_path} ({len(bundle_files)} files)")
+                bundles_created += 1
+            
+            print(f"\\nCreated {bundles_created} bundles in {output_dir}")
+            
+        elif args.command == "create-context":
+            directory = Path(args.directory)
+            if not directory.exists():
+                print(f"Error: Directory {directory} does not exist", file=sys.stderr)
+                sys.exit(1)
+            
+            # Collect files
+            files = ready_tool.collect_files(
+                directory,
+                include_patterns=args.include if args.include else None,
+                exclude_patterns=args.exclude if args.exclude else None,
+                file_types=args.types if args.types else None,
+                recursive=recursive
+            )
+            
+            if not files:
+                print("No files found matching criteria.")
+                sys.exit(0)
+            
+            # Create context document
+            title = args.title or f"Context for {directory.name}"
+            context = ready_tool.create_context_document(files, title)
+            
+            # Save context
+            output_path = Path(args.output)
+            with open(output_path, 'w') as f:
+                f.write(context)
+            
+            print(f"Created context document: {output_path} ({len(files)} files)")
+            
+        elif args.command == "analyze-codebase":
+            directory = Path(args.directory)
+            if not directory.exists():
+                print(f"Error: Directory {directory} does not exist", file=sys.stderr)
+                sys.exit(1)
+            
+            print(f"Analyzing codebase: {directory}")
+            analysis = ready_tool.analyze_codebase(directory, recursive)
+            
+            if args.report:
+                # Generate readable report
+                report = ready_tool.generate_analysis_report(analysis)
+                
+                if args.output:
+                    with open(args.output, 'w') as f:
+                        f.write(report)
+                    print(f"Analysis report saved to: {args.output}")
+                else:
+                    print(report)
+            else:
+                # Output JSON analysis
+                if args.output:
+                    with open(args.output, 'w') as f:
+                        json.dump(analysis, f, indent=2, default=str)
+                    print(f"Analysis data saved to: {args.output}")
+                else:
+                    print(json.dumps(analysis, indent=2, default=str))
+    
+    except KeyboardInterrupt:
+        print("\\nOperation interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

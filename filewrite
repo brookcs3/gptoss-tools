@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""
+FILEWRITE - Advanced file creation and editing tool for GPT OSS workflows
+
+Usage:
+    ./filewrite create test.py --template=python
+    ./filewrite edit config.yaml --add-section="new_config"
+    ./filewrite backup --all
+"""
+
+import os
+import sys
+import argparse
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional
+import yaml
+import datetime
+import tempfile
+
+class FileWriteTool:
+    def __init__(self, config_path: str = None):
+        self.config = self.load_config(config_path)
+        self.backup_enabled = self.config.get('tools', {}).get('filewrite', {}).get('backup_enabled', True)
+        self.backup_dir = Path(self.config.get('tools', {}).get('filewrite', {}).get('backup_directory', '.backups'))
+        
+    def load_config(self, config_path: str = None) -> dict:
+        """Load configuration from YAML file"""
+        if config_path is None:
+            config_path = Path(__file__).parent / "config.yaml"
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def get_templates(self) -> Dict[str, str]:
+        """Get file templates for different types"""
+        return {
+            'python': '''#!/usr/bin/env python3
+"""
+{filename} - GPT OSS Project File
+
+Created: {date}
+"""
+
+def main():
+    """Main function"""
+    pass
+
+if __name__ == "__main__":
+    main()
+''',
+            'javascript': '''/**
+ * {filename} - GPT OSS Project File
+ * Created: {date}
+ */
+
+function main() {{
+    // Your code here
+}}
+
+if (require.main === module) {{
+    main();
+}}
+
+module.exports = {{ main }};
+''',
+            'typescript': '''/**
+ * {filename} - GPT OSS Project File
+ * Created: {date}
+ */
+
+export function main(): void {{
+    // Your code here
+}}
+
+if (require.main === module) {{
+    main();
+}}
+''',
+            'shell': '''#!/bin/bash
+# {filename} - GPT OSS Project Script
+# Created: {date}
+
+set -euo pipefail
+
+main() {{
+    echo "GPT OSS script running..."
+    # Your code here
+}}
+
+main "$@"
+''',
+            'yaml': '''# {filename} - GPT OSS Configuration
+# Created: {date}
+
+name: {basename}
+version: "1.0.0"
+description: "GPT OSS project configuration"
+
+settings:
+  enabled: true
+  # Add your configuration here
+''',
+            'markdown': '''# {basename}
+
+*GPT OSS Project Documentation*  
+Created: {date}
+
+## Overview
+
+Describe your project here.
+
+## Usage
+
+```bash
+# Example usage
+```
+
+## Configuration
+
+Document configuration options.
+
+## Contributing
+
+Guidelines for contributors.
+''',
+            'dockerfile': '''# {filename} - GPT OSS Project Container
+# Created: {date}
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "main.py"]
+''',
+            'makefile': '''# {filename} - GPT OSS Project Makefile
+# Created: {date}
+
+.PHONY: help install test clean
+
+help:
+\t@echo "Available targets:"
+\t@echo "  install  - Install dependencies"
+\t@echo "  test     - Run tests"
+\t@echo "  clean    - Clean build artifacts"
+
+install:
+\t@echo "Installing dependencies..."
+
+test:
+\t@echo "Running tests..."
+
+clean:
+\t@echo "Cleaning up..."
+'''
+        }
+    
+    def backup_file(self, file_path: Path) -> Optional[Path]:
+        """Create a backup of an existing file"""
+        if not self.backup_enabled or not file_path.exists():
+            return None
+        
+        # Create backup directory
+        self.backup_dir.mkdir(exist_ok=True)
+        
+        # Generate backup filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"{file_path.name}.{timestamp}.bak"
+        backup_path = self.backup_dir / backup_name
+        
+        try:
+            shutil.copy2(file_path, backup_path)
+            return backup_path
+        except OSError as e:
+            print(f"Warning: Could not create backup: {e}", file=sys.stderr)
+            return None
+    
+    def create_file(self, file_path: Path, template: str = None, content: str = None,
+                   force: bool = False) -> bool:
+        """Create a new file with optional template"""
+        # Check if file exists
+        if file_path.exists() and not force:
+            print(f"Error: File {file_path} already exists. Use --force to overwrite.", file=sys.stderr)
+            return False
+        
+        # Backup existing file if needed
+        if file_path.exists():
+            backup_path = self.backup_file(file_path)
+            if backup_path:
+                print(f"Backed up existing file to: {backup_path}")
+        
+        # Get content to write
+        if content is None:
+            if template:
+                templates = self.get_templates()
+                if template not in templates:
+                    available = ", ".join(templates.keys())
+                    print(f"Error: Unknown template '{template}'. Available: {available}", file=sys.stderr)
+                    return False
+                
+                # Format template with file information
+                content = templates[template].format(
+                    filename=file_path.name,
+                    basename=file_path.stem,
+                    date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+            else:
+                content = ""
+        
+        try:
+            # Create parent directories if needed
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write file
+            with open(file_path, 'w') as f:
+                f.write(content)
+            
+            # Make executable if it's a script
+            if template in ['python', 'shell'] or file_path.suffix in ['.py', '.sh']:
+                file_path.chmod(0o755)
+            
+            print(f"Created: {file_path}")
+            return True
+            
+        except OSError as e:
+            print(f"Error creating file: {e}", file=sys.stderr)
+            return False
+    
+    def edit_file(self, file_path: Path, operation: str, value: str = None) -> bool:
+        """Edit an existing file with various operations"""
+        if not file_path.exists():
+            print(f"Error: File {file_path} does not exist.", file=sys.stderr)
+            return False
+        
+        # Backup file
+        backup_path = self.backup_file(file_path)
+        if backup_path:
+            print(f"Created backup: {backup_path}")
+        
+        try:
+            # Read current content
+            with open(file_path, 'r') as f:
+                content = f.read()
+            
+            # Perform operation
+            if operation == "append":
+                content += "\\n" + (value or "")
+            elif operation == "prepend":
+                content = (value or "") + "\\n" + content
+            elif operation == "replace":
+                if not value or "=" not in value:
+                    print("Error: Replace operation requires format 'old=new'", file=sys.stderr)
+                    return False
+                old, new = value.split("=", 1)
+                content = content.replace(old, new)
+            elif operation == "add-section":
+                # Add a new section (useful for config files)
+                section_name = value or "new_section"
+                section_content = f"\\n\\n# {section_name}\\n# Add configuration here\\n"
+                content += section_content
+            else:
+                print(f"Error: Unknown operation '{operation}'", file=sys.stderr)
+                return False
+            
+            # Write modified content
+            with open(file_path, 'w') as f:
+                f.write(content)
+            
+            print(f"Modified: {file_path}")
+            return True
+            
+        except OSError as e:
+            print(f"Error editing file: {e}", file=sys.stderr)
+            return False
+    
+    def backup_all(self, directory: Path = None, pattern: str = "*") -> int:
+        """Backup all files matching pattern in directory"""
+        if directory is None:
+            directory = Path(".")
+        
+        count = 0
+        for file_path in directory.glob(pattern):
+            if file_path.is_file() and not str(file_path).startswith('.'):
+                backup_path = self.backup_file(file_path)
+                if backup_path:
+                    print(f"Backed up: {file_path} -> {backup_path}")
+                    count += 1
+        
+        print(f"Backed up {count} files to {self.backup_dir}")
+        return count
+    
+    def list_backups(self) -> List[Path]:
+        """List all backup files"""
+        if not self.backup_dir.exists():
+            return []
+        
+        backups = list(self.backup_dir.glob("*.bak"))
+        backups.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        return backups
+    
+    def restore_backup(self, backup_path: Path, target_path: Path = None) -> bool:
+        """Restore a file from backup"""
+        if not backup_path.exists():
+            print(f"Error: Backup file {backup_path} does not exist.", file=sys.stderr)
+            return False
+        
+        if target_path is None:
+            # Derive target path from backup name
+            original_name = backup_path.name.split('.')[0]
+            target_path = Path(original_name)
+        
+        try:
+            shutil.copy2(backup_path, target_path)
+            print(f"Restored: {backup_path} -> {target_path}")
+            return True
+        except OSError as e:
+            print(f"Error restoring backup: {e}", file=sys.stderr)
+            return False
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FILEWRITE - Advanced file creation and editing for GPT OSS",
+        epilog="""
+Examples:
+  %(prog)s create main.py --template=python
+  %(prog)s create script.sh --template=shell
+  %(prog)s edit config.yaml --operation=add-section --value="database"
+  %(prog)s backup --all
+  %(prog)s list-backups
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    
+    # Create command
+    create_parser = subparsers.add_parser("create", help="Create a new file")
+    create_parser.add_argument("file", help="File to create")
+    create_parser.add_argument("-t", "--template", help="Template to use")
+    create_parser.add_argument("-c", "--content", help="Initial content")
+    create_parser.add_argument("-f", "--force", action="store_true", help="Overwrite existing file")
+    
+    # Edit command
+    edit_parser = subparsers.add_parser("edit", help="Edit an existing file")
+    edit_parser.add_argument("file", help="File to edit")
+    edit_parser.add_argument("-o", "--operation", required=True,
+                            choices=["append", "prepend", "replace", "add-section"],
+                            help="Edit operation to perform")
+    edit_parser.add_argument("-v", "--value", help="Value for the operation")
+    
+    # Backup commands
+    backup_parser = subparsers.add_parser("backup", help="Backup files")
+    backup_parser.add_argument("--all", action="store_true", help="Backup all files")
+    backup_parser.add_argument("-p", "--pattern", default="*", help="File pattern to backup")
+    backup_parser.add_argument("-d", "--directory", default=".", help="Directory to backup")
+    
+    # List backups
+    list_parser = subparsers.add_parser("list-backups", help="List available backups")
+    
+    # Restore backup
+    restore_parser = subparsers.add_parser("restore", help="Restore from backup")
+    restore_parser.add_argument("backup", help="Backup file to restore")
+    restore_parser.add_argument("-t", "--target", help="Target file (optional)")
+    
+    # Templates command
+    templates_parser = subparsers.add_parser("templates", help="List available templates")
+    
+    # Global options
+    parser.add_argument("--config", help="Path to config file")
+    
+    args = parser.parse_args()
+    
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+    
+    # Initialize tool
+    filewrite = FileWriteTool(args.config)
+    
+    try:
+        if args.command == "create":
+            success = filewrite.create_file(
+                Path(args.file),
+                template=args.template,
+                content=args.content,
+                force=args.force
+            )
+            sys.exit(0 if success else 1)
+            
+        elif args.command == "edit":
+            success = filewrite.edit_file(
+                Path(args.file),
+                operation=args.operation,
+                value=args.value
+            )
+            sys.exit(0 if success else 1)
+            
+        elif args.command == "backup":
+            if args.all:
+                count = filewrite.backup_all(Path(args.directory), args.pattern)
+                sys.exit(0)
+            else:
+                print("Use --all to backup all files matching pattern")
+                sys.exit(1)
+                
+        elif args.command == "list-backups":
+            backups = filewrite.list_backups()
+            if backups:
+                print("Available backups:")
+                for backup in backups:
+                    mtime = datetime.datetime.fromtimestamp(backup.stat().st_mtime)
+                    print(f"  {backup.name} ({mtime.strftime('%Y-%m-%d %H:%M:%S')})")
+            else:
+                print("No backups found.")
+            
+        elif args.command == "restore":
+            success = filewrite.restore_backup(
+                Path(args.backup),
+                Path(args.target) if args.target else None
+            )
+            sys.exit(0 if success else 1)
+            
+        elif args.command == "templates":
+            templates = filewrite.get_templates()
+            print("Available templates:")
+            for name in sorted(templates.keys()):
+                print(f"  {name}")
+    
+    except KeyboardInterrupt:
+        print("\\nOperation interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

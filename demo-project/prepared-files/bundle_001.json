@@ -1,0 +1,35 @@
+{
+  "name": "bundle_001",
+  "created": "2025-08-07T00:03:46.069870",
+  "file_count": 2,
+  "files": [
+    {
+      "path": "hello.py",
+      "name": "hello.py",
+      "size": 24,
+      "size_human": "24.0B",
+      "modified": 1754550177.89231,
+      "modified_human": "2025-08-07 00:02:57",
+      "type": "code",
+      "extension": ".py",
+      "lines": 1,
+      "content": "print(\"Hello GPT OSS!\")\n",
+      "content_hash": "a7cb27e047b0b22eb997962449370b89"
+    },
+    {
+      "path": "math_utils.py",
+      "name": "math_utils.py",
+      "size": 34,
+      "size_human": "34.0B",
+      "modified": 1754550177.8924305,
+      "modified_human": "2025-08-07 00:02:57",
+      "type": "code",
+      "extension": ".py",
+      "lines": 1,
+      "content": "def calculate(x, y): return x + y\n",
+      "content_hash": "ddb7a911501975a1f33de19651273094"
+    }
+  ],
+  "total_size": 58,
+  "total_size_human": "58.0B"
+}

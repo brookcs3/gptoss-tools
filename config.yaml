@@ -1,0 +1,79 @@
+# GPT OSS Tools Configuration
+gptoss:
+  # Ollama server configuration
+  server:
+    host: "localhost"
+    port: 11434
+    base_url: "http://localhost:11434/v1"
+  
+  # Default model settings
+  models:
+    default: "gpt-oss:20b"
+    fallback: "gpt-oss:120b"
+    
+  # Tool-specific settings
+  tools:
+    glop:
+      max_results: 1000
+      default_recursive: true
+      ignore_patterns:
+        - "node_modules"
+        - ".git"
+        - "__pycache__"
+        - "*.pyc"
+        - ".DS_Store"
+        
+    grep:
+      max_file_size: "10MB"
+      context_lines: 3
+      case_sensitive: false
+      
+    search:
+      index_directory: ".gptoss-index"
+      max_file_size: "5MB"
+      supported_types:
+        - ".py"
+        - ".js"
+        - ".ts"
+        - ".md"
+        - ".txt"
+        - ".json"
+        - ".yaml"
+        - ".yml"
+        
+    read:
+      syntax_highlighting: true
+      line_numbers: true
+      max_lines: 500
+      
+    filewrite:
+      backup_enabled: true
+      backup_directory: ".backups"
+      
+    readymyfiles:
+      output_directory: "prepared-files"
+      max_files_per_bundle: 50
+      include_metadata: true
+
+# File type associations
+file_types:
+  code:
+    - ".py"
+    - ".js"
+    - ".ts"
+    - ".go"
+    - ".rs"
+    - ".cpp"
+    - ".c"
+    - ".java"
+  config:
+    - ".yaml"
+    - ".yml"
+    - ".json"
+    - ".toml"
+    - ".ini"
+  docs:
+    - ".md"
+    - ".txt"
+    - ".rst"
+    - ".tex"

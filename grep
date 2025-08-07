@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""
+GREP - Advanced text search tool for GPT OSS workflows
+
+Usage:
+    ./grep "function" --include="*.js"
+    ./grep "class.*:" --python --context=5
+    ./grep "TODO|FIXME" --regex --recursive
+"""
+
+import os
+import sys
+import re
+import argparse
+from pathlib import Path
+from typing import List, Dict, Iterator, Tuple, Optional
+import yaml
+
+class GrepTool:
+    def __init__(self, config_path: str = None):
+        self.config = self.load_config(config_path)
+        self.max_file_size = self.parse_size(
+            self.config.get('tools', {}).get('grep', {}).get('max_file_size', '10MB')
+        )
+        
+    def load_config(self, config_path: str = None) -> dict:
+        """Load configuration from YAML file"""
+        if config_path is None:
+            config_path = Path(__file__).parent / "config.yaml"
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def parse_size(self, size_str: str) -> int:
+        """Parse size string like '10MB' to bytes"""
+        if isinstance(size_str, int):
+            return size_str
+            
+        units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}
+        size_str = str(size_str).upper().strip()
+        
+        for unit in units:
+            if size_str.endswith(unit):
+                size_part = size_str[:-len(unit)].strip()
+                if size_part:
+                    try:
+                        return int(float(size_part) * units[unit])
+                    except ValueError:
+                        continue
+        
+        # Try to parse as just a number
+        try:
+            return int(float(size_str))
+        except ValueError:
+            return 10 * 1024 * 1024  # Default to 10MB
+    
+    def should_search_file(self, file_path: Path, include_patterns: List[str] = None,
+                          exclude_patterns: List[str] = None) -> bool:
+        """Check if file should be searched based on patterns and size"""
+        # Check file size
+        try:
+            if file_path.stat().st_size > self.max_file_size:
+                return False
+        except OSError:
+            return False
+        
+        # Check include patterns
+        if include_patterns:
+            matches_include = False
+            for pattern in include_patterns:
+                if self.matches_pattern(file_path, pattern):
+                    matches_include = True
+                    break
+            if not matches_include:
+                return False
+        
+        # Check exclude patterns
+        if exclude_patterns:
+            for pattern in exclude_patterns:
+                if self.matches_pattern(file_path, pattern):
+                    return False
+        
+        return True
+    
+    def matches_pattern(self, file_path: Path, pattern: str) -> bool:
+        """Check if file matches a pattern"""
+        import fnmatch
+        return fnmatch.fnmatch(str(file_path), pattern) or fnmatch.fnmatch(file_path.name, pattern)
+    
+    def search_in_file(self, file_path: Path, pattern: str, regex: bool = False,
+                      case_sensitive: bool = False, context_lines: int = 0) -> List[Dict]:
+        """Search for pattern in a single file"""
+        results = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except (OSError, UnicodeDecodeError):
+            return results
+        
+        # Compile regex pattern
+        flags = 0 if case_sensitive else re.IGNORECASE
+        if regex:
+            try:
+                compiled_pattern = re.compile(pattern, flags)
+            except re.error:
+                return results
+        else:
+            # Escape special regex characters for literal search
+            escaped_pattern = re.escape(pattern)
+            compiled_pattern = re.compile(escaped_pattern, flags)
+        
+        # Search through lines
+        for line_num, line in enumerate(lines, 1):
+            line = line.rstrip('\\n')
+            match = compiled_pattern.search(line)
+            
+            if match:
+                # Get context lines
+                start_line = max(0, line_num - context_lines - 1)
+                end_line = min(len(lines), line_num + context_lines)
+                
+                context = []
+                for i in range(start_line, end_line):
+                    context_line = lines[i].rstrip('\\n')
+                    is_match_line = (i == line_num - 1)
+                    context.append({
+                        'line_num': i + 1,
+                        'content': context_line,
+                        'is_match': is_match_line,
+                        'match_start': match.start() if is_match_line else None,
+                        'match_end': match.end() if is_match_line else None
+                    })
+                
+                results.append({
+                    'file': file_path,
+                    'line_num': line_num,
+                    'line': line,
+                    'match': match,
+                    'context': context
+                })
+        
+        return results
+    
+    def search_directory(self, directory: Path, pattern: str, recursive: bool = False,
+                        include_patterns: List[str] = None, exclude_patterns: List[str] = None,
+                        **search_kwargs) -> Iterator[Dict]:
+        """Search for pattern in directory"""
+        if recursive:
+            file_iterator = directory.rglob("*")
+        else:
+            file_iterator = directory.glob("*")
+        
+        for file_path in file_iterator:
+            if not file_path.is_file():
+                continue
+                
+            if not self.should_search_file(file_path, include_patterns, exclude_patterns):
+                continue
+            
+            file_results = self.search_in_file(file_path, pattern, **search_kwargs)
+            for result in file_results:
+                yield result
+    
+    def search(self, pattern: str, paths: List[str] = None, recursive: bool = False,
+               include_patterns: List[str] = None, exclude_patterns: List[str] = None,
+               **search_kwargs) -> List[Dict]:
+        """Main search function"""
+        if not paths:
+            paths = ["."]
+        
+        results = []
+        
+        for path_str in paths:
+            path = Path(path_str)
+            
+            if path.is_file():
+                if self.should_search_file(path, include_patterns, exclude_patterns):
+                    file_results = self.search_in_file(path, pattern, **search_kwargs)
+                    results.extend(file_results)
+            elif path.is_dir():
+                dir_results = self.search_directory(
+                    path, pattern, recursive, include_patterns, exclude_patterns, **search_kwargs
+                )
+                results.extend(dir_results)
+        
+        return results
+    
+    def format_output(self, results: List[Dict], show_filename: bool = True,
+                     show_line_numbers: bool = True, colorize: bool = True) -> str:
+        """Format search results for output"""
+        if not results:
+            return "No matches found."
+        
+        lines = []
+        current_file = None
+        
+        for result in results:
+            file_path = result['file']
+            
+            # Show filename header if it changed
+            if show_filename and file_path != current_file:
+                current_file = file_path
+                lines.append(f"\\n{self.colorize(str(file_path), 'purple', colorize)}")
+                lines.append("-" * min(len(str(file_path)), 80))
+            
+            # Show context
+            for context_line in result['context']:
+                line_prefix = ""
+                
+                if show_line_numbers:
+                    line_prefix = f"{context_line['line_num']:4d}: "
+                
+                if context_line['is_match']:
+                    # Highlight the match
+                    content = context_line['content']
+                    if colorize and context_line['match_start'] is not None:
+                        start = context_line['match_start']
+                        end = context_line['match_end']
+                        highlighted = (
+                            content[:start] + 
+                            self.colorize(content[start:end], 'red', True) +
+                            content[end:]
+                        )
+                        content = highlighted
+                    
+                    line_prefix = self.colorize(line_prefix, 'green', colorize)
+                    lines.append(f"{line_prefix}{content}")
+                else:
+                    # Context line
+                    line_prefix = self.colorize(line_prefix, 'blue', colorize)
+                    lines.append(f"{line_prefix}{context_line['content']}")
+        
+        # Add summary
+        file_count = len(set(result['file'] for result in results))
+        match_count = len(results)
+        
+        summary = f"\\nFound {match_count} matches in {file_count} files."
+        lines.append(self.colorize(summary, 'yellow', colorize))
+        
+        return "\\n".join(lines)
+    
+    def colorize(self, text: str, color: str, enabled: bool = True) -> str:
+        """Add color to text if enabled"""
+        if not enabled:
+            return text
+        
+        colors = {
+            'red': '\\033[31m',
+            'green': '\\033[32m',
+            'yellow': '\\033[33m',
+            'blue': '\\033[34m',
+            'purple': '\\033[35m',
+            'cyan': '\\033[36m',
+            'reset': '\\033[0m'
+        }
+        
+        return f"{colors.get(color, '')}{text}{colors['reset']}"
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GREP - Advanced text search for GPT OSS workflows",
+        epilog="""
+Examples:
+  %(prog)s "function" --include="*.js" --recursive
+  %(prog)s "class.*:" --regex --python --context=3
+  %(prog)s "TODO|FIXME" --regex --case-sensitive
+  %(prog)s "import" --exclude="*.pyc" --line-numbers
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument("pattern", help="Text pattern to search for")
+    parser.add_argument("paths", nargs="*", default=["."], help="Files or directories to search")
+    
+    # Search options
+    parser.add_argument("-r", "--recursive", action="store_true",
+                       help="Search recursively through subdirectories")
+    parser.add_argument("-i", "--ignore-case", action="store_true",
+                       help="Ignore case when searching")
+    parser.add_argument("-E", "--regex", action="store_true",
+                       help="Treat pattern as regular expression")
+    parser.add_argument("-C", "--context", type=int, default=0,
+                       help="Number of context lines to show around matches")
+    
+    # File filtering
+    parser.add_argument("--include", action="append", default=[],
+                       help="Include files matching pattern")
+    parser.add_argument("--exclude", action="append", default=[],
+                       help="Exclude files matching pattern")
+    
+    # Language shortcuts
+    parser.add_argument("--python", action="store_true",
+                       help="Search only Python files (*.py)")
+    parser.add_argument("--javascript", action="store_true",
+                       help="Search only JavaScript files (*.js)")
+    parser.add_argument("--typescript", action="store_true",
+                       help="Search only TypeScript files (*.ts)")
+    parser.add_argument("--code", action="store_true",
+                       help="Search only code files")
+    
+    # Output options
+    parser.add_argument("-n", "--line-numbers", action="store_true",
+                       help="Show line numbers")
+    parser.add_argument("--no-filename", action="store_true",
+                       help="Don't show filenames")
+    parser.add_argument("--no-color", action="store_true",
+                       help="Disable colored output")
+    parser.add_argument("-c", "--config", help="Path to config file")
+    
+    args = parser.parse_args()
+    
+    # Initialize tool
+    grep_tool = GrepTool(args.config)
+    
+    # Set up include patterns based on language flags
+    if args.python:
+        args.include.append("*.py")
+    if args.javascript:
+        args.include.append("*.js")
+    if args.typescript:
+        args.include.append("*.ts")
+    if args.code:
+        code_patterns = grep_tool.config.get('file_types', {}).get('code', [])
+        args.include.extend([f"*{ext}" for ext in code_patterns])
+    
+    # Get default context from config if not specified
+    if args.context == 0:
+        args.context = grep_tool.config.get('tools', {}).get('grep', {}).get('context_lines', 0)
+    
+    # Determine case sensitivity
+    case_sensitive = not args.ignore_case
+    if not args.ignore_case:
+        # Check config default
+        case_sensitive = grep_tool.config.get('tools', {}).get('grep', {}).get('case_sensitive', True)
+    
+    try:
+        # Perform search
+        results = grep_tool.search(
+            pattern=args.pattern,
+            paths=args.paths,
+            recursive=args.recursive,
+            include_patterns=args.include if args.include else None,
+            exclude_patterns=args.exclude if args.exclude else None,
+            regex=args.regex,
+            case_sensitive=case_sensitive,
+            context_lines=args.context
+        )
+        
+        # Format and print results
+        output = grep_tool.format_output(
+            results,
+            show_filename=not args.no_filename,
+            show_line_numbers=args.line_numbers,
+            colorize=not args.no_color and sys.stdout.isatty()
+        )
+        print(output)
+        
+        # Return appropriate exit code
+        sys.exit(0 if results else 1)
+        
+    except KeyboardInterrupt:
+        print("\\nSearch interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

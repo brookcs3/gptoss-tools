@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+GLOP - Advanced file pattern matching and discovery tool for GPT OSS workflows
+
+Usage:
+    ./glop "*.py" --recursive
+    ./glop "test_*.js" --exclude="node_modules"
+    ./glop "**/*.md" --max-results=100
+"""
+
+import os
+import sys
+import argparse
+import fnmatch
+import re
+from pathlib import Path
+from typing import List, Set, Iterator
+import yaml
+
+class GlopTool:
+    def __init__(self, config_path: str = None):
+        self.config = self.load_config(config_path)
+        self.ignore_patterns = set(self.config.get('tools', {}).get('glop', {}).get('ignore_patterns', []))
+        
+    def load_config(self, config_path: str = None) -> dict:
+        """Load configuration from YAML file"""
+        if config_path is None:
+            config_path = Path(__file__).parent / "config.yaml"
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def should_ignore(self, path: Path) -> bool:
+        """Check if path should be ignored based on patterns"""
+        path_str = str(path)
+        for pattern in self.ignore_patterns:
+            if fnmatch.fnmatch(path_str, pattern) or fnmatch.fnmatch(path.name, pattern):
+                return True
+        return False
+    
+    def glob_recursive(self, pattern: str, root_dir: str = ".") -> Iterator[Path]:
+        """Recursively find files matching pattern"""
+        root = Path(root_dir).resolve()
+        
+        # Handle ** patterns for recursive search
+        if "**" in pattern:
+            # Convert glob pattern to regex for more control
+            regex_pattern = pattern.replace("**", ".*").replace("*", "[^/]*").replace("?", "[^/]")
+            regex = re.compile(regex_pattern)
+            
+            for path in root.rglob("*"):
+                if path.is_file() and not self.should_ignore(path):
+                    rel_path = path.relative_to(root)
+                    if regex.match(str(rel_path)):
+                        yield path
+        else:
+            # Use standard glob for simple patterns
+            for path in root.glob(pattern):
+                if path.is_file() and not self.should_ignore(path):
+                    yield path
+    
+    def glob_simple(self, pattern: str, root_dir: str = ".") -> Iterator[Path]:
+        """Find files matching pattern in single directory"""
+        root = Path(root_dir).resolve()
+        
+        for path in root.glob(pattern):
+            if path.is_file() and not self.should_ignore(path):
+                yield path
+    
+    def search(self, patterns: List[str], recursive: bool = False, 
+               exclude: List[str] = None, max_results: int = None) -> List[Path]:
+        """Search for files matching patterns"""
+        results = []
+        exclude_patterns = exclude or []
+        
+        for pattern in patterns:
+            if recursive:
+                matches = self.glob_recursive(pattern)
+            else:
+                matches = self.glob_simple(pattern)
+                
+            for match in matches:
+                # Apply exclude patterns
+                should_exclude = False
+                for exclude_pattern in exclude_patterns:
+                    if fnmatch.fnmatch(str(match), exclude_pattern):
+                        should_exclude = True
+                        break
+                
+                if not should_exclude and match not in results:
+                    results.append(match)
+                    
+                    # Check max results limit
+                    if max_results and len(results) >= max_results:
+                        return results
+        
+        return sorted(results)
+    
+    def format_output(self, results: List[Path], show_size: bool = False, 
+                     show_modified: bool = False) -> str:
+        """Format search results for output"""
+        if not results:
+            return "No files found matching the specified patterns."
+        
+        lines = []
+        total_size = 0
+        
+        for path in results:
+            line = str(path)
+            
+            if show_size or show_modified:
+                try:
+                    stat = path.stat()
+                    if show_size:
+                        size = stat.st_size
+                        total_size += size
+                        line += f" ({self.format_size(size)})"
+                    if show_modified:
+                        import datetime
+                        mtime = datetime.datetime.fromtimestamp(stat.st_mtime)
+                        line += f" [modified: {mtime.strftime('%Y-%m-%d %H:%M')}]"
+                except OSError:
+                    pass
+            
+            lines.append(line)
+        
+        footer = f"\\nFound {len(results)} files"
+        if show_size:
+            footer += f", total size: {self.format_size(total_size)}"
+        
+        return "\\n".join(lines) + footer
+    
+    def format_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f}{unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f}TB"
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GLOP - Advanced file pattern matching for GPT OSS workflows",
+        epilog="""
+Examples:
+  %(prog)s "*.py" --recursive          # Find all Python files recursively
+  %(prog)s "test_*.js" --exclude="node_modules"  # Find test JS files, exclude node_modules
+  %(prog)s "**/*.md" --max-results=50  # Find up to 50 Markdown files
+  %(prog)s "*.{py,js,ts}" --size       # Find code files and show sizes
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument("patterns", nargs="+", help="File patterns to search for")
+    parser.add_argument("-r", "--recursive", action="store_true", 
+                       help="Search recursively through subdirectories")
+    parser.add_argument("-e", "--exclude", action="append", default=[],
+                       help="Patterns to exclude from results")
+    parser.add_argument("-m", "--max-results", type=int,
+                       help="Maximum number of results to return")
+    parser.add_argument("-s", "--size", action="store_true",
+                       help="Show file sizes")
+    parser.add_argument("-t", "--time", action="store_true",
+                       help="Show modification times")
+    parser.add_argument("-c", "--config", help="Path to config file")
+    parser.add_argument("--directory", default=".", help="Directory to search in")
+    
+    args = parser.parse_args()
+    
+    # Initialize tool
+    glop = GlopTool(args.config)
+    
+    # Override config with command line arguments
+    if args.max_results is None:
+        args.max_results = glop.config.get('tools', {}).get('glop', {}).get('max_results')
+    
+    if not args.recursive:
+        args.recursive = glop.config.get('tools', {}).get('glop', {}).get('default_recursive', False)
+    
+    try:
+        # Search for files
+        results = glop.search(
+            patterns=args.patterns,
+            recursive=args.recursive,
+            exclude=args.exclude,
+            max_results=args.max_results
+        )
+        
+        # Format and print results
+        output = glop.format_output(results, show_size=args.size, show_modified=args.time)
+        print(output)
+        
+        # Return appropriate exit code
+        sys.exit(0 if results else 1)
+        
+    except KeyboardInterrupt:
+        print("\\nSearch interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+# GPT OSS Tools - Python Dependencies
+
+# Core dependencies
+PyYAML>=6.0
+
+# Optional dependencies for enhanced functionality
+pygments>=2.0  # Syntax highlighting in read tool
+
+# Development dependencies (optional)
+pytest>=7.0    # For running tests
+black>=22.0    # Code formatting
+flake8>=5.0    # Code linting

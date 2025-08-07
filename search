@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+"""
+SEARCH - Content indexing and semantic search tool for GPT OSS workflows
+
+Usage:
+    ./search index --directory=./src
+    ./search "machine learning concepts" --semantic
+    ./search "function definition" --code-only
+"""
+
+import os
+import sys
+import argparse
+import json
+import sqlite3
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import yaml
+import hashlib
+import datetime
+
+class SearchTool:
+    def __init__(self, config_path: str = None):
+        self.config = self.load_config(config_path)
+        self.index_dir = Path(self.config.get('tools', {}).get('search', {}).get('index_directory', '.gptoss-index'))
+        self.max_file_size = self.parse_size(
+            self.config.get('tools', {}).get('search', {}).get('max_file_size', '5MB')
+        )
+        self.supported_types = set(
+            self.config.get('tools', {}).get('search', {}).get('supported_types', ['.py', '.js', '.md', '.txt'])
+        )
+        self.db_path = self.index_dir / 'search_index.db'
+        
+    def load_config(self, config_path: str = None) -> dict:
+        """Load configuration from YAML file"""
+        if config_path is None:
+            config_path = Path(__file__).parent / "config.yaml"
+            
+        try:
+            with open(config_path, 'r') as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return {}
+    
+    def parse_size(self, size_str: str) -> int:
+        """Parse size string like '5MB' to bytes"""
+        if isinstance(size_str, int):
+            return size_str
+            
+        units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3}
+        size_str = str(size_str).upper().strip()
+        
+        for unit in units:
+            if size_str.endswith(unit):
+                size_part = size_str[:-len(unit)].strip()
+                if size_part:
+                    try:
+                        return int(float(size_part) * units[unit])
+                    except ValueError:
+                        continue
+        
+        # Try to parse as just a number
+        try:
+            return int(float(size_str))
+        except ValueError:
+            return 5 * 1024 * 1024  # Default to 5MB
+    
+    def init_database(self):
+        """Initialize the search database"""
+        self.index_dir.mkdir(exist_ok=True)
+        
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE,
+                content_hash TEXT,
+                size INTEGER,
+                modified_time REAL,
+                file_type TEXT,
+                indexed_time REAL
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS content_chunks (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER,
+                chunk_index INTEGER,
+                content TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                FOREIGN KEY (file_id) REFERENCES files (id)
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS search_terms (
+                id INTEGER PRIMARY KEY,
+                term TEXT UNIQUE,
+                frequency INTEGER DEFAULT 1
+            )
+        ''')
+        
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS term_occurrences (
+                id INTEGER PRIMARY KEY,
+                term_id INTEGER,
+                chunk_id INTEGER,
+                count INTEGER,
+                FOREIGN KEY (term_id) REFERENCES search_terms (id),
+                FOREIGN KEY (chunk_id) REFERENCES content_chunks (id)
+            )
+        ''')
+        
+        # Create indexes for better performance
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_files_path ON files (path)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_files_hash ON files (content_hash)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_chunks_file ON content_chunks (file_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_terms_term ON search_terms (term)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_occurrences_term ON term_occurrences (term_id)')
+        
+        conn.commit()
+        conn.close()
+    
+    def get_file_hash(self, file_path: Path) -> str:
+        """Get hash of file content"""
+        hasher = hashlib.md5()
+        try:
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except OSError:
+            return ""
+    
+    def should_index_file(self, file_path: Path) -> bool:
+        """Check if file should be indexed"""
+        if not file_path.is_file():
+            return False
+        
+        # Check file extension
+        if file_path.suffix.lower() not in self.supported_types:
+            return False
+        
+        # Check file size
+        try:
+            if file_path.stat().st_size > self.max_file_size:
+                return False
+        except OSError:
+            return False
+        
+        # Skip hidden files and common ignore patterns
+        if file_path.name.startswith('.'):
+            return False
+        
+        ignore_patterns = ['__pycache__', 'node_modules', '.git', '.svn', '.hg']
+        for pattern in ignore_patterns:
+            if pattern in str(file_path):
+                return False
+        
+        return True
+    
+    def extract_text_content(self, file_path: Path) -> Tuple[str, str]:
+        """Extract text content and determine file type"""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+        except OSError:
+            return "", "unknown"
+        
+        # Determine file type
+        extension = file_path.suffix.lower()
+        type_map = {
+            '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+            '.java': 'java', '.cpp': 'cpp', '.c': 'c',
+            '.md': 'markdown', '.txt': 'text', '.json': 'json',
+            '.yaml': 'yaml', '.yml': 'yaml'
+        }
+        file_type = type_map.get(extension, 'text')
+        
+        return content, file_type
+    
+    def chunk_content(self, content: str, chunk_size: int = 1000, overlap: int = 200) -> List[Dict]:
+        """Split content into overlapping chunks"""
+        lines = content.split('\\n')
+        chunks = []
+        
+        current_chunk = []
+        current_size = 0
+        start_line = 1
+        
+        for line_num, line in enumerate(lines, 1):
+            current_chunk.append(line)
+            current_size += len(line) + 1  # +1 for newline
+            
+            # Check if chunk is large enough
+            if current_size >= chunk_size:
+                chunk_content = '\\n'.join(current_chunk)
+                chunks.append({
+                    'content': chunk_content,
+                    'start_line': start_line,
+                    'end_line': line_num
+                })
+                
+                # Create overlap for next chunk
+                if overlap > 0:
+                    overlap_lines = []
+                    overlap_size = 0
+                    for i in range(len(current_chunk) - 1, -1, -1):
+                        overlap_lines.insert(0, current_chunk[i])
+                        overlap_size += len(current_chunk[i]) + 1
+                        if overlap_size >= overlap:
+                            break
+                    
+                    current_chunk = overlap_lines
+                    current_size = overlap_size
+                    start_line = line_num - len(overlap_lines) + 1
+                else:
+                    current_chunk = []
+                    current_size = 0
+                    start_line = line_num + 1
+        
+        # Add remaining content as final chunk
+        if current_chunk:
+            chunk_content = '\\n'.join(current_chunk)
+            chunks.append({
+                'content': chunk_content,
+                'start_line': start_line,
+                'end_line': len(lines)
+            })
+        
+        return chunks
+    
+    def extract_terms(self, content: str) -> Dict[str, int]:
+        """Extract search terms from content"""
+        import re
+        
+        # Simple tokenization - split on non-alphanumeric characters
+        words = re.findall(r'\\b\\w+\\b', content.lower())
+        
+        # Count term frequencies
+        term_counts = {}
+        for word in words:
+            if len(word) >= 3:  # Skip very short words
+                term_counts[word] = term_counts.get(word, 0) + 1
+        
+        return term_counts
+    
+    def index_file(self, file_path: Path) -> bool:
+        """Index a single file"""
+        if not self.should_index_file(file_path):
+            return False
+        
+        # Get file info
+        file_stat = file_path.stat()
+        content_hash = self.get_file_hash(file_path)
+        content, file_type = self.extract_text_content(file_path)
+        
+        if not content.strip():
+            return False
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        try:
+            # Check if file is already indexed and up to date
+            cursor = conn.execute(
+                'SELECT id, content_hash, modified_time FROM files WHERE path = ?',
+                (str(file_path),)
+            )
+            existing = cursor.fetchone()
+            
+            if existing and existing[1] == content_hash and existing[2] == file_stat.st_mtime:
+                # File is already up to date
+                conn.close()
+                return True
+            
+            # Remove existing entries for this file
+            if existing:
+                file_id = existing[0]
+                conn.execute('DELETE FROM term_occurrences WHERE chunk_id IN (SELECT id FROM content_chunks WHERE file_id = ?)', (file_id,))
+                conn.execute('DELETE FROM content_chunks WHERE file_id = ?', (file_id,))
+                conn.execute('DELETE FROM files WHERE id = ?', (file_id,))
+            
+            # Insert file record
+            cursor = conn.execute('''
+                INSERT INTO files (path, content_hash, size, modified_time, file_type, indexed_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (str(file_path), content_hash, file_stat.st_size, file_stat.st_mtime, file_type, datetime.datetime.now().timestamp()))
+            
+            file_id = cursor.lastrowid
+            
+            # Chunk content and index
+            chunks = self.chunk_content(content)
+            
+            for chunk_index, chunk in enumerate(chunks):
+                # Insert chunk
+                cursor = conn.execute('''
+                    INSERT INTO content_chunks (file_id, chunk_index, content, start_line, end_line)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (file_id, chunk_index, chunk['content'], chunk['start_line'], chunk['end_line']))
+                
+                chunk_id = cursor.lastrowid
+                
+                # Extract and index terms
+                terms = self.extract_terms(chunk['content'])
+                
+                for term, count in terms.items():
+                    # Insert or update term
+                    conn.execute('''
+                        INSERT OR IGNORE INTO search_terms (term, frequency) VALUES (?, 0)
+                    ''', (term,))
+                    
+                    conn.execute('''
+                        UPDATE search_terms SET frequency = frequency + ? WHERE term = ?
+                    ''', (count, term))
+                    
+                    # Get term ID
+                    cursor = conn.execute('SELECT id FROM search_terms WHERE term = ?', (term,))
+                    term_id = cursor.fetchone()[0]
+                    
+                    # Insert term occurrence
+                    conn.execute('''
+                        INSERT INTO term_occurrences (term_id, chunk_id, count) VALUES (?, ?, ?)
+                    ''', (term_id, chunk_id, count))
+            
+            conn.commit()
+            return True
+            
+        except Exception as e:
+            print(f"Error indexing {file_path}: {e}", file=sys.stderr)
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+    
+    def index_directory(self, directory: Path, recursive: bool = True) -> Tuple[int, int]:
+        """Index all files in a directory"""
+        self.init_database()
+        
+        indexed_count = 0
+        total_count = 0
+        
+        if recursive:
+            file_iterator = directory.rglob("*")
+        else:
+            file_iterator = directory.glob("*")
+        
+        for file_path in file_iterator:
+            if file_path.is_file():
+                total_count += 1
+                if self.index_file(file_path):
+                    indexed_count += 1
+                    print(f"Indexed: {file_path}")
+        
+        return indexed_count, total_count
+    
+    def search_text(self, query: str, limit: int = 50) -> List[Dict]:
+        """Search for text in indexed content"""
+        if not self.db_path.exists():
+            return []
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        # Simple text search using LIKE
+        search_terms = query.lower().split()
+        
+        results = []
+        
+        for term in search_terms:
+            try:
+                cursor = conn.execute('''
+                    SELECT f.path, f.file_type, c.content, c.start_line, c.end_line
+                    FROM files f
+                    JOIN content_chunks c ON f.id = c.file_id
+                    WHERE LOWER(c.content) LIKE ?
+                    ORDER BY f.path
+                    LIMIT ?
+                ''', (f'%{term}%', limit))
+                
+                for row in cursor.fetchall():
+                    path, file_type, content, start_line, end_line = row
+                    
+                    # Simple scoring based on term frequency in content
+                    term_count = content.lower().count(term)
+                    score = term_count
+                    
+                    results.append({
+                        'path': path,
+                        'file_type': file_type,
+                        'content': content,
+                        'start_line': start_line,
+                        'end_line': end_line,
+                        'term': term,
+                        'count': term_count,
+                        'score': score
+                    })
+                    
+            except sqlite3.Error as e:
+                print(f"Database error for term '{term}': {e}", file=sys.stderr)
+                continue
+        
+        conn.close()
+        
+        # Sort by score and remove duplicates
+        results.sort(key=lambda x: x['score'], reverse=True)
+        seen_paths = set()
+        unique_results = []
+        
+        for result in results:
+            path_key = f"{result['path']}:{result['start_line']}"
+            if path_key not in seen_paths:
+                unique_results.append(result)
+                seen_paths.add(path_key)
+                if len(unique_results) >= limit:
+                    break
+        
+        return unique_results
+    
+    def get_index_stats(self) -> Dict:
+        """Get statistics about the search index"""
+        if not self.db_path.exists():
+            return {'files': 0, 'chunks': 0, 'terms': 0}
+        
+        conn = sqlite3.connect(self.db_path)
+        
+        stats = {}
+        
+        # Count files
+        cursor = conn.execute('SELECT COUNT(*) FROM files')
+        stats['files'] = cursor.fetchone()[0]
+        
+        # Count chunks
+        cursor = conn.execute('SELECT COUNT(*) FROM content_chunks')
+        stats['chunks'] = cursor.fetchone()[0]
+        
+        # Count unique terms
+        cursor = conn.execute('SELECT COUNT(*) FROM search_terms')
+        stats['terms'] = cursor.fetchone()[0]
+        
+        # Get file types
+        cursor = conn.execute('SELECT file_type, COUNT(*) FROM files GROUP BY file_type')
+        stats['file_types'] = dict(cursor.fetchall())
+        
+        # Index size
+        stats['index_size'] = self.db_path.stat().st_size if self.db_path.exists() else 0
+        
+        conn.close()
+        return stats
+    
+    def clear_index(self):
+        """Clear the search index"""
+        if self.db_path.exists():
+            self.db_path.unlink()
+        print("Search index cleared.")
+    
+    def format_size(self, size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024:
+                return f"{size_bytes:.1f}{unit}"
+            size_bytes /= 1024
+        return f"{size_bytes:.1f}TB"
+
+def main():
+    # Check if first argument is a subcommand
+    has_subcommand = len(sys.argv) > 1 and sys.argv[1] in ['index', 'stats', 'clear']
+    
+    parser = argparse.ArgumentParser(
+        description="SEARCH - Content indexing and search for GPT OSS workflows",
+        epilog="""
+Examples:
+  %(prog)s index --directory=./src --recursive
+  %(prog)s "machine learning" --limit=20
+  %(prog)s "class definition" --code-only
+  %(prog)s stats
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    if has_subcommand:
+        # Use subparsers when we have a subcommand
+        subparsers = parser.add_subparsers(dest="command", help="Available commands")
+        
+        # Index command
+        index_parser = subparsers.add_parser("index", help="Index files for searching")
+        index_parser.add_argument("-d", "--directory", default=".", help="Directory to index")
+        index_parser.add_argument("-r", "--recursive", action="store_true", help="Index recursively")
+        
+        # Stats command
+        stats_parser = subparsers.add_parser("stats", help="Show index statistics")
+        
+        # Clear command
+        clear_parser = subparsers.add_parser("clear", help="Clear the search index")
+        
+        # Global options
+        parser.add_argument("--config", help="Path to config file")
+    else:
+        # Direct search mode
+        parser.add_argument("query", help="Search query")
+        parser.add_argument("-l", "--limit", type=int, default=20, help="Maximum number of results")
+        parser.add_argument("--code-only", action="store_true", help="Search only code files")
+        parser.add_argument("--docs-only", action="store_true", help="Search only documentation files")
+        parser.add_argument("--config", help="Path to config file")
+    
+    args = parser.parse_args()
+    
+    # Initialize tool
+    search_tool = SearchTool(args.config)
+    
+    try:
+        command = getattr(args, 'command', None)
+        
+        if command == "index":
+            directory = Path(args.directory)
+            if not directory.exists():
+                print(f"Error: Directory {directory} does not exist", file=sys.stderr)
+                sys.exit(1)
+            
+            print(f"Indexing directory: {directory}")
+            indexed, total = search_tool.index_directory(directory, args.recursive)
+            print(f"Indexed {indexed} of {total} files")
+            
+        elif command == "stats":
+            stats = search_tool.get_index_stats()
+            print(f"Index Statistics:")
+            print(f"  Files: {stats['files']}")
+            print(f"  Content chunks: {stats['chunks']}")
+            print(f"  Unique terms: {stats['terms']}")
+            print(f"  Index size: {search_tool.format_size(stats['index_size'])}")
+            
+            if stats.get('file_types'):
+                print(f"\\nFile types:")
+                for file_type, count in sorted(stats['file_types'].items()):
+                    print(f"  {file_type}: {count}")
+                    
+        elif command == "clear":
+            search_tool.clear_index()
+            
+        else:
+            # Direct search mode
+            if not hasattr(args, 'query') or not args.query:
+                parser.print_help()
+                sys.exit(1)
+            
+            results = search_tool.search_text(args.query, getattr(args, 'limit', 20))
+            
+            if not results:
+                print("No results found.")
+                sys.exit(1)
+            
+            print(f"Found {len(results)} results for '{args.query}':\\n")
+            
+            for i, result in enumerate(results, 1):
+                print(f"{i}. {result['path']} ({result['file_type']})")
+                print(f"   Lines {result['start_line']}-{result['end_line']}")
+                print(f"   Score: {result['score']:.2f}")
+                
+                # Show snippet of content
+                content_lines = result['content'].split('\\n')
+                snippet = '\\n'.join(content_lines[:3])
+                if len(content_lines) > 3:
+                    snippet += "\\n..."
+                print(f"   Preview: {snippet[:150]}{'...' if len(snippet) > 150 else ''}")
+                print()
+    
+    except KeyboardInterrupt:
+        print("\\nOperation interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
