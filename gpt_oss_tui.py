@@ -126,33 +126,17 @@ class ChatPanel(Container):
         chat_history.scroll_end()
     
     def get_ai_response(self, user_message: str):
-        """Get response from GPT OSS model"""
+        """Get response from GPT OSS model with proper tool calling"""
         try:
             # Show typing indicator
             self.add_message("assistant", "🤔 Thinking...")
             
-            # Prepare the prompt with system context
-            system_prompt = """You are GPT OSS, an AI assistant integrated into a powerful development toolkit. You can help with:
-
-1. **File Operations**: Finding, reading, and analyzing files
-2. **Code Search**: Searching through codebases and finding patterns  
-3. **Project Analysis**: Understanding project structure and dependencies
-4. **Tool Execution**: Running development tools and commands
-
-Available tools in this environment:
-- `glop <pattern>` - Find files by pattern (e.g., "*.py", "*.js")
-- `grep <query>` - Search file contents for text patterns
-- `search <query>` - Semantic search through indexed files
-- `read <file>` - Display file contents with syntax highlighting
-- `readymyfiles` - Prepare files for AI analysis
-- `filewrite` - Create and edit files
-
-When users ask you to perform actions, suggest specific tool commands or execute them if requested. Be helpful, practical, and focus on developer productivity.
-
-User message: """
-            
-            # Call Ollama API
-            response = self._call_ollama(system_prompt + user_message)
+            # Try tool calling first, fall back to simple if it fails
+            try:
+                response = self._call_ollama_with_tools(user_message)
+            except Exception as e:
+                print(f"Tool calling failed, falling back to simple: {e}")
+                response = self._call_ollama_simple(user_message)
             
             # Remove typing indicator and add real response
             chat_history = self.query_one("#chat_history", ScrollableContainer)
@@ -182,13 +166,13 @@ User message: """
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.7,
-                "max_tokens": 4096
+                "temperature": 0.8,
+                "max_tokens": 128000
             }
         }
         
         # Define stream variable to match the parameter in the request
-        response = requests.post(self.ollama_url, json=data, timeout=90)
+        response = requests.post(self.ollama_url, json=data, stream=True, timeout=90)
         response.raise_for_status()
         
         result = response.json()
@@ -200,6 +184,170 @@ User message: """
             thinking_panel.add_thinking(thinking)
         
         return result.get("response", "No response generated")
+    
+    def _call_ollama_with_tools(self, user_message: str) -> str:
+        """Call Ollama using Chat Completions format with tools"""
+        import requests
+        
+        # Define tools using OpenAI function calling format
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "file_operations",
+                    "description": "Find, read, and search files in the project",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": ["find", "read", "grep", "search", "analyze"],
+                                "description": "Operation to perform"
+                            },
+                            "query": {
+                                "type": "string", 
+                                "description": "Search query, file pattern, or filename"
+                            }
+                        },
+                        "required": ["operation", "query"]
+                    }
+                }
+            }
+        ]
+        
+        # Use Chat Completions API format 
+        messages = [
+            {
+                "role": "system",
+                "content": "You are GPT OSS, an AI development assistant. Use the file_operations function to help users find, read, and search files. When users ask for file operations, call the appropriate function."
+            },
+            {
+                "role": "user", 
+                "content": user_message
+            }
+        ]
+        
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+            "options": {
+                "temperature": 0.8,
+                "max_tokens": 128000
+            }
+        }
+        
+        # Use chat endpoint for tool calling
+        response = requests.post("http://localhost:11434/v1/chat/completions", json=data, timeout=90)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        # Handle tool calls
+        message = result.get("choices", [{}])[0].get("message", {})
+        
+        # Extract thinking if present
+        if "thinking" in result:
+            thinking = result.get("thinking", "")
+            if thinking.strip():
+                thinking_panel = self.app.query_one("#thinking_panel", ThinkingPanel)
+                thinking_panel.add_thinking(thinking)
+        
+        # Check for tool calls
+        tool_calls = message.get("tool_calls", [])
+        if tool_calls:
+            return self._handle_tool_calls(tool_calls, message)
+        else:
+            return message.get("content", "No response generated")
+    
+    def _call_ollama_simple(self, user_message: str) -> str:
+        """Fallback to original working format"""
+        system_prompt = """You are GPT OSS, an AI assistant integrated into a powerful development toolkit. You can help with:
+1. **File Operations**: Finding, reading, and analyzing files
+2. **Code Search**: Searching through codebases and finding patterns  
+3. **Project Analysis**: Understanding project structure and dependencies
+4. **Tool Execution**: Running development tools and commands
+Available tools in this environment:
+- `glop <pattern>` - Find files by pattern (e.g., "*.py", "*.js")
+- `grep <query>` - Search file contents for text patterns
+- `search <query>` - Semantic search through indexed files
+- `read <file>` - Display file contents with syntax highlighting
+- `readymyfiles` - Prepare files for AI analysis
+- `filewrite` - Create and edit files
+
+When users ask you to perform actions, suggest specific tool commands or execute them if requested. Be helpful, practical, and focus on developer productivity.
+User message: """
+        
+        # Use original working API format
+        return self._call_ollama(system_prompt + user_message)
+    
+    def _handle_tool_calls(self, tool_calls: list, message: dict) -> str:
+        """Handle OpenAI-style tool calls"""
+        results = []
+        
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            function_name = function.get("name")
+            
+            if function_name == "file_operations":
+                # Parse arguments
+                import json
+                try:
+                    args = json.loads(function.get("arguments", "{}"))
+                    operation = args.get("operation")
+                    query = args.get("query") 
+                    
+                    # Execute the tool
+                    result = self._execute_file_operation(operation, query)
+                    results.append(f"**{operation.title()} Results:**\n{result}")
+                    
+                except Exception as e:
+                    results.append(f"❌ Tool error: {str(e)}")
+        
+        # Return tool results along with any message content
+        content = message.get("content", "")
+        if results:
+            if content:
+                return f"{content}\n\n" + "\n\n".join(results)
+            else:
+                return "\n\n".join(results)
+        else:
+            return content or "Tool executed successfully"
+    
+    def _execute_file_operation(self, operation: str, query: str) -> str:
+        """Execute file operations using existing tools"""
+        try:
+            tools_dir = Path(__file__).parent
+            
+            if operation == "find":
+                cmd = ["./glop", query, "--recursive"]
+            elif operation == "read":
+                cmd = ["./read", query]
+            elif operation == "grep":
+                cmd = ["./grep", query]
+            elif operation == "search":
+                cmd = ["./search", query] 
+            elif operation == "analyze":
+                cmd = ["./readymyfiles", "analyze-codebase", "--report"]
+            else:
+                return f"❌ Unknown operation: {operation}"
+                
+            result = subprocess.run(
+                cmd,
+                cwd=tools_dir,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0:
+                return f"```\n{result.stdout}\n```"
+            else:
+                return f"❌ Error:\n```\n{result.stderr}\n```"
+                
+        except Exception as e:
+            return f"❌ Execution failed: {str(e)}"
     
     def _handle_tool_suggestions(self, response: str):
         """Execute tool commands suggested by AI"""

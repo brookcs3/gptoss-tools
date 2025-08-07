@@ -2,6 +2,8 @@
 
 # Core dependencies
 PyYAML>=6.0
+textual>=5.0  # TUI framework for gpt_oss_tui.py
+requests>=2.31.0  # HTTP requests for Ollama API
 
 # Optional dependencies for enhanced functionality
 pygments>=2.0  # Syntax highlighting in read tool

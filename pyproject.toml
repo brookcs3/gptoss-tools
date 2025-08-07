@@ -1,0 +1,17 @@
+[project]
+name = "gptoss-tools"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "black>=22.0",
+    "flake8>=5.0",
+    "gpt-oss>=0.0.1",
+    "openai-harmony>=0.0.3",
+    "pygments>=2.0",
+    "pytest>=7.0",
+    "pyyaml>=6.0",
+    "requests>=2.32.4",
+    "textual>=5.3.0",
+]
